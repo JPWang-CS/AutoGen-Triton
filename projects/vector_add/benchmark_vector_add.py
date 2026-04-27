@@ -1,12 +1,16 @@
 """
 Triton-Ascend 向量加法性能基准测试
 
-使用 triton.testing.perf_report 框架进行性能测试。
-对比 Triton kernel 与 PyTorch 原生实现：
+三种模式对比：
+  - Triton Naive: GPU 风格 grid，可能远超物理核数
+  - Triton Persistent: NPU 推荐的固定核数 + 跨步分配
+  - PyTorch: 原生 a + b
+
+性能指标:
   - 执行时间 (ms)
   - 带宽 (GB/s)
-  - 加速比 (Triton / PyTorch)
-  - 数值精度 (是否通过 rtol=1e-3, atol=1e-3)
+  - 加速比
+  - 数值精度 (rtol=1e-3, atol=1e-3)
 """
 
 import argparse
@@ -33,18 +37,15 @@ def ref_program(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
         x_vals=[2**i for i in range(12, 24, 1)],  # 4K to 16M elements
         x_log=True,
         line_arg="provider",
-        line_vals=["triton", "torch"],
-        line_names=["Triton", "PyTorch"],
-        styles=[("blue", "-"), ("green", "-")],
+        line_vals=["naive", "persistent", "torch"],
+        line_names=["Triton-Naive", "Triton-Persistent", "PyTorch"],
+        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
         ylabel="GB/s",
         plot_name="vector-add-performance",
         args={},
     )
 )
 def benchmark(size, provider):
-    """
-    性能基准测试函数（带宽指标）
-    """
     a = torch.randn(size, device="npu", dtype=torch.float32)
     b = torch.randn(size, device="npu", dtype=torch.float32)
     quantiles = [0.5, 0.2, 0.8]
@@ -53,18 +54,21 @@ def benchmark(size, provider):
         ms, min_ms, max_ms = triton.testing.do_bench(
             lambda: ref_program(a, b), quantiles=quantiles
         )
-    elif provider == "triton":
+    elif provider == "naive":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: vector_add(a, b), quantiles=quantiles
+            lambda: vector_add(a, b, persistent=False), quantiles=quantiles
+        )
+    elif provider == "persistent":
+        ms, min_ms, max_ms = triton.testing.do_bench(
+            lambda: vector_add(a, b, persistent=True), quantiles=quantiles
         )
 
-    # 带宽: 读 2 个输入 + 写 1 个输出 = 3 * size * 4 bytes (float32)
     gbps = lambda ms: 3 * size * 4 / (ms * 1e-6) * 1e-9
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
 # ============================================================================
-# 详细对比 benchmark
+# 详细对比 benchmark (三路对比)
 # ============================================================================
 
 def run_comparison_benchmark(
@@ -73,79 +77,66 @@ def run_comparison_benchmark(
     warmup: int = 10,
     rep: int = 100,
 ):
-    """
-    运行 Triton vs PyTorch 详细对比测试，输出：
-      - 执行时间
-      - 带宽
-      - 加速比
-      - 数值精度
-    """
     element_bytes = torch.tensor([], dtype=dtype).element_size()
     dtype_name = {
-        torch.float32: "float32",
-        torch.float16: "float16",
-        torch.bfloat16: "bfloat16",
+        torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
     }.get(dtype, str(dtype))
 
-    # 创建输入
     a = torch.randn(size, device="npu", dtype=dtype)
     b = torch.randn(size, device="npu", dtype=dtype)
 
-    # ---------- 数值精度验证 ----------
-    c_triton = vector_add(a, b)
+    # 数值精度 (persistent 模式)
+    c_triton = vector_add(a, b, persistent=True)
+    c_naive = vector_add(a, b, persistent=False)
     c_torch = ref_program(a, b)
-
     max_diff = torch.max(torch.abs(c_triton.cpu().float() - c_torch.cpu().float())).item()
     mean_diff = torch.mean(torch.abs(c_triton.cpu().float() - c_torch.cpu().float())).item()
-
-    # 精度检查: rtol=1e-3, atol=1e-3
-    rtol, atol = 1e-3, 1e-3
     precision_pass = torch.allclose(
-        c_triton.cpu().float(), c_torch.cpu().float(), rtol=rtol, atol=atol
+        c_triton.cpu().float(), c_torch.cpu().float(), rtol=1e-3, atol=1e-3
     )
 
-    # ---------- 性能测试 ----------
+    # 性能
     quantiles = [0.5, 0.2, 0.8]
-
-    ms_triton, min_triton, max_triton = triton.testing.do_bench(
-        lambda: vector_add(a, b), quantiles=quantiles, warmup=warmup, rep=rep
+    ms_naive, min_naive, max_naive = triton.testing.do_bench(
+        lambda: vector_add(a, b, persistent=False), quantiles=quantiles, warmup=warmup, rep=rep
+    )
+    ms_persistent, min_persistent, max_persistent = triton.testing.do_bench(
+        lambda: vector_add(a, b, persistent=True), quantiles=quantiles, warmup=warmup, rep=rep
     )
     ms_torch, min_torch, max_torch = triton.testing.do_bench(
         lambda: ref_program(a, b), quantiles=quantiles, warmup=warmup, rep=rep
     )
 
-    # 带宽: 2 读 + 1 写
     bytes_moved = 3 * size * element_bytes
-    bw_triton = bytes_moved / (ms_triton * 1e-6) * 1e-9  # GB/s
+    bw_naive = bytes_moved / (ms_naive * 1e-6) * 1e-9
+    bw_persistent = bytes_moved / (ms_persistent * 1e-6) * 1e-9
     bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
+    speedup_naive = ms_torch / ms_naive
+    speedup_persistent = ms_torch / ms_persistent
 
-    # 加速比
-    speedup = ms_torch / ms_triton
-
-    # ---------- 输出结果 ----------
     data_size_mb = size * element_bytes / 1024 / 1024
 
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 80)
     print(f"  Vector Add Benchmark  |  size={size:,}  |  dtype={dtype_name}")
     print(f"  数据量: {data_size_mb:.2f} MB per tensor, 总搬运 {3 * data_size_mb:.2f} MB")
-    print("=" * 70)
+    print("=" * 80)
 
-    # 执行时间
-    print(f"\n  {'指标':<20} {'Triton':>12} {'PyTorch':>12} {'单位':>8}")
-    print(f"  {'-'*52}")
-    print(f"  {'中位数延迟':<20} {ms_triton:>12.4f} {ms_torch:>12.4f} {'ms':>8}")
-    print(f"  {'最小延迟':<20} {min_triton:>12.4f} {min_torch:>12.4f} {'ms':>8}")
-    print(f"  {'最大延迟':<20} {max_triton:>12.4f} {max_torch:>12.4f} {'ms':>8}")
-    print(f"  {'带宽':<20} {bw_triton:>12.2f} {bw_torch:>12.2f} {'GB/s':>8}")
+    print(f"\n  {'指标':<20} {'Naive':>12} {'Persistent':>12} {'PyTorch':>12} {'单位':>8}")
+    print(f"  {'-'*64}")
+    print(f"  {'中位数延迟':<20} {ms_naive:>12.4f} {ms_persistent:>12.4f} {ms_torch:>12.4f} {'ms':>8}")
+    print(f"  {'最小延迟':<20} {min_naive:>12.4f} {min_persistent:>12.4f} {min_torch:>12.4f} {'ms':>8}")
+    print(f"  {'最大延迟':<20} {max_naive:>12.4f} {max_persistent:>12.4f} {max_torch:>12.4f} {'ms':>8}")
+    print(f"  {'带宽':<20} {bw_naive:>12.2f} {bw_persistent:>12.2f} {bw_torch:>12.2f} {'GB/s':>8}")
 
-    # 加速比
-    print(f"\n  {'加速比 (Triton/PyTorch)':<30} {speedup:.3f}x")
-    if speedup > 1.0:
-        print(f"  Triton 比 PyTorch 快 {(speedup - 1) * 100:.1f}%")
+    print(f"\n  {'加速比 vs PyTorch':<25} Naive: {speedup_naive:.3f}x  |  Persistent: {speedup_persistent:.3f}x")
+    if speedup_persistent > 1.0:
+        print(f"  Persistent 比 PyTorch 快 {(speedup_persistent - 1) * 100:.1f}%")
     else:
-        print(f"  Triton 比 PyTorch 慢 {(1 - speedup) * 100:.1f}%")
+        print(f"  Persistent 比 PyTorch 慢 {(1 - speedup_persistent) * 100:.1f}%")
 
-    # 数值精度
+    improvement = ms_naive / ms_persistent
+    print(f"  Persistent vs Naive 提升: {improvement:.2f}x (固定核数 vs 大量 program)")
+
     print(f"\n  {'数值精度':<20} {'值':>12}")
     print(f"  {'-'*32}")
     print(f"  {'最大绝对误差':<20} {max_diff:>12.2e}")
@@ -153,21 +144,20 @@ def run_comparison_benchmark(
     print(f"  {'精度要求':<20} {'rtol=1e-3, atol=1e-3':>12}")
     print(f"  {'是否通过':<20} {'PASS':>12}" if precision_pass else f"  {'是否通过':<20} {'FAIL':>12}")
 
-    print("=" * 70)
+    print("=" * 80)
 
     return {
-        "size": size,
-        "dtype": dtype_name,
-        "ms_triton": ms_triton,
-        "ms_torch": ms_torch,
-        "bw_triton": bw_triton,
-        "bw_torch": bw_torch,
-        "speedup": speedup,
-        "max_diff": max_diff,
-        "mean_diff": mean_diff,
-        "precision_pass": precision_pass,
+        "size": size, "dtype": dtype_name,
+        "ms_naive": ms_naive, "ms_persistent": ms_persistent, "ms_torch": ms_torch,
+        "bw_naive": bw_naive, "bw_persistent": bw_persistent, "bw_torch": bw_torch,
+        "speedup_naive": speedup_naive, "speedup_persistent": speedup_persistent,
+        "max_diff": max_diff, "precision_pass": precision_pass,
     }
 
+
+# ============================================================================
+# Sweep benchmark (三路对比)
+# ============================================================================
 
 def run_sweep_benchmark(
     sizes=None,
@@ -175,84 +165,80 @@ def run_sweep_benchmark(
     warmup: int = 10,
     rep: int = 100,
 ):
-    """
-    多规模扫描测试，汇总输出对比表格
-    """
     if sizes is None:
         sizes = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024]
 
     element_bytes = torch.tensor([], dtype=dtype).element_size()
     dtype_name = {
-        torch.float32: "float32",
-        torch.float16: "float16",
-        torch.bfloat16: "bfloat16",
+        torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
     }.get(dtype, str(dtype))
 
-    print("\n" + "=" * 100)
+    print("\n" + "=" * 130)
     print(f"  Vector Add Sweep Benchmark  |  dtype={dtype_name}")
-    print("=" * 100)
-    print(f"  {'Size':>10} | {'Triton(ms)':>10} {'Torch(ms)':>10} | "
-          f"{'Triton(GB/s)':>12} {'Torch(GB/s)':>12} | "
-          f"{'Speedup':>8} | {'MaxDiff':>10} | {'Pass':>5}")
-    print(f"  {'-'*96}")
+    print("=" * 130)
+    print(f"  {'Size':>10} | {'Naive(ms)':>10} {'Persist(ms)':>11} {'Torch(ms)':>10} | "
+          f"{'Naive(GB/s)':>11} {'Persist(GB/s)':>13} {'Torch(GB/s)':>11} | "
+          f"{'SP-Naive':>8} {'SP-Pers':>8} | {'Diff':>10} | {'Pass':>5}")
+    print(f"  {'-'*126}")
 
     results = []
     for size in sizes:
         a = torch.randn(size, device="npu", dtype=dtype)
         b = torch.randn(size, device="npu", dtype=dtype)
 
-        # 精度
-        c_triton = vector_add(a, b)
+        c_triton = vector_add(a, b, persistent=True)
         c_torch = ref_program(a, b)
         max_diff = torch.max(torch.abs(c_triton.cpu().float() - c_torch.cpu().float())).item()
         precision_pass = torch.allclose(
             c_triton.cpu().float(), c_torch.cpu().float(), rtol=1e-3, atol=1e-3
         )
 
-        # 性能
-        ms_triton, _, _ = triton.testing.do_bench(
-            lambda: vector_add(a, b), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
+        ms_naive, _, _ = triton.testing.do_bench(
+            lambda: vector_add(a, b, persistent=False), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
+        )
+        ms_persistent, _, _ = triton.testing.do_bench(
+            lambda: vector_add(a, b, persistent=True), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
         )
         ms_torch, _, _ = triton.testing.do_bench(
             lambda: ref_program(a, b), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
         )
 
         bytes_moved = 3 * size * element_bytes
-        bw_triton = bytes_moved / (ms_triton * 1e-6) * 1e-9
+        bw_naive = bytes_moved / (ms_naive * 1e-6) * 1e-9
+        bw_persistent = bytes_moved / (ms_persistent * 1e-6) * 1e-9
         bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
-        speedup = ms_torch / ms_triton
+        sp_naive = ms_torch / ms_naive
+        sp_persistent = ms_torch / ms_persistent
 
         size_str = f"{size//1024}K" if size < 1024*1024 else f"{size//1024//1024}M"
         pass_str = "PASS" if precision_pass else "FAIL"
 
-        print(f"  {size_str:>10} | {ms_triton:>10.4f} {ms_torch:>10.4f} | "
-              f"{bw_triton:>12.2f} {bw_torch:>12.2f} | "
-              f"{speedup:>7.3f}x | {max_diff:>10.2e} | {pass_str:>5}")
-
+        print(f"  {size_str:>10} | {ms_naive:>10.4f} {ms_persistent:>11.4f} {ms_torch:>10.4f} | "
+              f"{bw_naive:>11.2f} {bw_persistent:>13.2f} {bw_torch:>11.2f} | "
+              f"{sp_naive:>7.3f}x {sp_persistent:>7.3f}x | {max_diff:>10.2e} | {pass_str:>5}")
         results.append({
-            "size": size, "ms_triton": ms_triton, "ms_torch": ms_torch,
-            "bw_triton": bw_triton, "bw_torch": bw_torch,
-            "speedup": speedup, "max_diff": max_diff, "pass": precision_pass,
+            "size": size, "ms_naive": ms_naive, "ms_persistent": ms_persistent, "ms_torch": ms_torch,
+            "speedup_naive": sp_naive, "speedup_persistent": sp_persistent,
+            "max_diff": max_diff, "pass": precision_pass,
         })
 
-    print("=" * 100)
-
-    # 汇总
+    print("=" * 130)
     all_pass = all(r["pass"] for r in results)
-    avg_speedup = sum(r["speedup"] for r in results) / len(results)
+    avg_sp_naive = sum(r["speedup_naive"] for r in results) / len(results)
+    avg_sp_persistent = sum(r["speedup_persistent"] for r in results) / len(results)
     print(f"\n  精度检查 (rtol=1e-3, atol=1e-3): {'ALL PASS' if all_pass else 'HAS FAIL'}")
-    print(f"  平均加速比: {avg_speedup:.3f}x")
+    print(f"  平均加速比 vs PyTorch:  Naive={avg_sp_naive:.3f}x  |  Persistent={avg_sp_persistent:.3f}x")
 
     return results
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Triton-Ascend Vector Add Benchmark"
+        description="Triton-Ascend Vector Add Benchmark (Naive vs Persistent vs PyTorch)"
     )
     parser.add_argument(
         "--size", type=int, default=1024 * 1024,
-        help="Vector size (number of elements), 用于单次对比测试"
+        help="Vector size (number of elements)"
     )
     parser.add_argument(
         "--dtype", type=str, default="float32",

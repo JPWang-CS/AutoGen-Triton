@@ -1,61 +1,86 @@
 """
 Triton-Ascend 向量加法 (Vector Add)
 
-最基础的 Triton 算子实现：C = A + B。
-每个 program 处理一段连续元素，通过 tl.load 读取输入，
-执行加法运算，再通过 tl.store 写入输出。
+两种实现模式：
+1. naive: GPU 风格，每个 program 处理一段连续元素（grid 数量可能远超物理核数）
+2. persistent: NPU 推荐模式，固定核数启动，跨步分配任务（tl.range）
 
 设计要点:
-- 1D grid: (n_elements + BLOCK_SIZE - 1) // BLOCK_SIZE 个 program
-- 每个 program 处理 BLOCK_SIZE 个元素
-- 使用 mask 处理尾部不完整的块
+- naive 模式: grid = (cdiv(n, BLOCK_SIZE),) — 大量 program，NPU 调度开销大
+- persistent 模式: grid = (num_cores,) — 固定核数，每个核循环处理多个块
 """
 
 import triton
 import triton.language as tl
+import triton.runtime.driver as driver
 import torch
 
 
+# ============================================================================
+# Naive kernel (GPU 风格，NPU 上性能差)
+# ============================================================================
+
 @triton.jit
-def _vector_add_kernel(
+def _vector_add_kernel_naive(
     a_ptr, b_ptr, c_ptr,
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """
-    向量加法 kernel: C[i] = A[i] + B[i]
-
-    参数:
-        a_ptr: 输入向量 A 的指针
-        b_ptr: 输入向量 B 的指针
-        c_ptr: 输出向量 C 的指针
-        n_elements: 元素总数
-        BLOCK_SIZE: 每个 program 处理的元素数
-    """
-    # 获取当前 program 的 ID
+    """每个 program 处理一段连续元素 — GPU 思维"""
     pid = tl.program_id(axis=0)
-
-    # 计算当前 program 负责的元素偏移量
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-
-    # 创建 mask，处理尾部不完整的块
     mask = offsets < n_elements
-
-    # 从全局内存加载数据
     a = tl.load(a_ptr + offsets, mask=mask)
     b = tl.load(b_ptr + offsets, mask=mask)
-
-    # 执行加法运算
     c = a + b
-
-    # 将结果写回全局内存
     tl.store(c_ptr + offsets, c, mask=mask)
+
+
+# ============================================================================
+# Persistent kernel (NPU 推荐模式)
+# ============================================================================
+
+@triton.jit
+def _vector_add_kernel_persistent(
+    a_ptr, b_ptr, c_ptr,
+    n_elements,
+    BLOCK_SIZE: tl.constexpr,
+    NUM_CORES: tl.constexpr,
+):
+    """
+    持久化 kernel: 固定 NUM_CORES 个 program，跨步分配任务。
+
+    每个 program 处理 pid, pid+NUM_CORES, pid+2*NUM_CORES, ... 的块。
+    使用 tl.range 替代 Python range，让编译器优化循环。
+    """
+    pid = tl.program_id(axis=0)
+
+    # tl.range: 编译器优化的跨步循环
+    for block_id in tl.range(pid, tl.cdiv(n_elements, BLOCK_SIZE), NUM_CORES):
+        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+        mask = offsets < n_elements
+        a = tl.load(a_ptr + offsets, mask=mask)
+        b = tl.load(b_ptr + offsets, mask=mask)
+        c = a + b
+        tl.store(c_ptr + offsets, c, mask=mask)
+
+
+# ============================================================================
+# Host 函数
+# ============================================================================
+
+def _get_num_vector_cores() -> int:
+    """获取 NPU Vector Core 数量"""
+    device = torch.npu.current_device()
+    props = driver.active.utils.get_device_properties(device)
+    return props["num_vectorcore"]
 
 
 def vector_add(
     a: torch.Tensor,
     b: torch.Tensor,
     block_size: int = 1024,
+    persistent: bool = True,
 ) -> torch.Tensor:
     """
     向量加法主机函数: C = A + B
@@ -63,26 +88,32 @@ def vector_add(
     参数:
         a: 输入向量 A，形状 (N,)
         b: 输入向量 B，形状 (N,)
-        block_size: 每个 program 处理的元素数
+        block_size: 每个 task 处理的元素数
+        persistent: True 使用持久化模式（推荐），False 使用 naive 模式
 
     返回:
         输出向量 C，形状与输入相同
     """
     assert a.shape == b.shape, "Input shapes must match"
     n_elements = a.numel()
-
-    # 分配输出张量
     c = torch.empty_like(a)
 
-    # 计算 grid 大小
-    grid = (triton.cdiv(n_elements, block_size),)
-
-    # 启动 kernel
-    _vector_add_kernel[grid](
-        a, b, c,
-        n_elements,
-        BLOCK_SIZE=block_size,
-    )
+    if persistent:
+        num_cores = _get_num_vector_cores()
+        grid = (num_cores,)
+        _vector_add_kernel_persistent[grid](
+            a, b, c,
+            n_elements,
+            BLOCK_SIZE=block_size,
+            NUM_CORES=num_cores,
+        )
+    else:
+        grid = (triton.cdiv(n_elements, block_size),)
+        _vector_add_kernel_naive[grid](
+            a, b, c,
+            n_elements,
+            BLOCK_SIZE=block_size,
+        )
 
     return c
 
@@ -100,17 +131,26 @@ def main():
     print(f"Vector size: {size}")
     print(f"Device: NPU")
 
+    num_cores = _get_num_vector_cores()
+    print(f"Vector Cores: {num_cores}")
+
     a = torch.randn(size, device="npu", dtype=torch.float32)
     b = torch.randn(size, device="npu", dtype=torch.float32)
 
-    c = vector_add(a, b)
+    # 测试 naive 模式
+    c_naive = vector_add(a, b, persistent=False)
     ref_c = ref_program(a, b)
-    torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
-    print("Correctness check passed!")
+    torch.testing.assert_close(c_naive.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
+    print("Naive mode: Correctness check passed!")
+
+    # 测试 persistent 模式
+    c_persistent = vector_add(a, b, persistent=True)
+    torch.testing.assert_close(c_persistent.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
+    print("Persistent mode: Correctness check passed!")
 
     print(f"\nInput A: {a.shape}, dtype={a.dtype}")
     print(f"Input B: {b.shape}, dtype={b.dtype}")
-    print(f"Output C: {c.shape}, dtype={c.dtype}")
+    print(f"Output C: {c_persistent.shape}, dtype={c_persistent.dtype}")
 
 
 if __name__ == "__main__":
