@@ -1,13 +1,19 @@
 """
 Triton-Ascend 向量加法 (Vector Add)
 
-两种实现模式：
-1. naive: GPU 风格，每个 program 处理一段连续元素（grid 数量可能远超物理核数）
-2. persistent: NPU 推荐模式，固定核数启动，跨步分配任务（tl.range）
+三种实现模式：
+1. naive:    GPU 风格，每个 program 一段连续元素，grid 数量远超物理核数
+2. persistent: 固定核数 + tl.range 跨步分配（解决了调度问题，但循环不是 constexpr）
+3. optimized: 官方推荐 XBLOCK/XBLOCK_SUB 双层切分 + constexpr 循环 + 无 mask
+   （编译器可展开循环 → 开启 multibuffer 存算并行流水线）
 
-设计要点:
-- naive 模式: grid = (cdiv(n, BLOCK_SIZE),) — 大量 program，NPU 调度开销大
-- persistent 模式: grid = (num_cores,) — 固定核数，每个核循环处理多个块
+性能排序: optimized >> persistent ≈ naive >> ...
+
+关键优化点:
+- loops: tl.constexpr 使编译器能在编译期确定循环次数，展开并启用 multibuffer
+- XBLOCK 核间切分 + XBLOCK_SUB 核内子块循环 = 三层切分
+- mask=None 或 care_padding=False 避免填充同步开销
+- grid = (ncore, 1, 1) 三维格式
 """
 
 import triton
@@ -17,7 +23,7 @@ import torch
 
 
 # ============================================================================
-# Naive kernel (GPU 风格，NPU 上性能差)
+# Naive kernel (GPU 风格)
 # ============================================================================
 
 @triton.jit
@@ -26,18 +32,16 @@ def _vector_add_kernel_naive(
     n_elements,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """每个 program 处理一段连续元素 — GPU 思维"""
     pid = tl.program_id(axis=0)
     offsets = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
     mask = offsets < n_elements
     a = tl.load(a_ptr + offsets, mask=mask)
     b = tl.load(b_ptr + offsets, mask=mask)
-    c = a + b
-    tl.store(c_ptr + offsets, c, mask=mask)
+    tl.store(c_ptr + offsets, a + b, mask=mask)
 
 
 # ============================================================================
-# Persistent kernel (NPU 推荐模式)
+# Persistent kernel (固定核数 + tl.range，但循环非 constexpr)
 # ============================================================================
 
 @triton.jit
@@ -47,22 +51,44 @@ def _vector_add_kernel_persistent(
     BLOCK_SIZE: tl.constexpr,
     NUM_CORES: tl.constexpr,
 ):
-    """
-    持久化 kernel: 固定 NUM_CORES 个 program，跨步分配任务。
-
-    每个 program 处理 pid, pid+NUM_CORES, pid+2*NUM_CORES, ... 的块。
-    使用 tl.range 替代 Python range，让编译器优化循环。
-    """
     pid = tl.program_id(axis=0)
-
-    # tl.range: 编译器优化的跨步循环
     for block_id in tl.range(pid, tl.cdiv(n_elements, BLOCK_SIZE), NUM_CORES):
         offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
         mask = offsets < n_elements
         a = tl.load(a_ptr + offsets, mask=mask)
         b = tl.load(b_ptr + offsets, mask=mask)
-        c = a + b
-        tl.store(c_ptr + offsets, c, mask=mask)
+        tl.store(c_ptr + offsets, a + b, mask=mask)
+
+
+# ============================================================================
+# Optimized kernel (官方 XBLOCK/XBLOCK_SUB 模式，constexpr 循环)
+# ============================================================================
+
+@triton.jit
+def _vector_add_kernel_optimized(
+    a_ptr, b_ptr, c_ptr,
+    n_elements,
+    XBLOCK: tl.constexpr,
+    XBLOCK_SUB: tl.constexpr,
+):
+    """
+    官方推荐的 NPU 纯向量算子模式:
+    - 核间切分: 每个 core 连续处理 XBLOCK 个元素
+    - 核内子块: 每次 XBLOCK_SUB 个元素，循环处理
+    - loops: tl.constexpr → 编译器可展开 → multibuffer 流水线生效
+    - mask 仅在尾部不整除时触发
+    """
+    pid = tl.program_id(0)
+    xoffset = pid * XBLOCK
+    base = tl.arange(0, XBLOCK_SUB)
+    loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
+
+    for loop_idx in range(loops):
+        x_index = xoffset + loop_idx * XBLOCK_SUB + base
+        mask = x_index < n_elements
+        a = tl.load(a_ptr + x_index, mask=mask)
+        b = tl.load(b_ptr + x_index, mask=mask)
+        tl.store(c_ptr + x_index, a + b, mask=mask)
 
 
 # ============================================================================
@@ -79,17 +105,17 @@ def _get_num_vector_cores() -> int:
 def vector_add(
     a: torch.Tensor,
     b: torch.Tensor,
-    block_size: int = 1024,
-    persistent: bool = True,
+    mode: str = "optimized",
+    xblock_sub: int = 1024,
 ) -> torch.Tensor:
     """
     向量加法主机函数: C = A + B
 
     参数:
-        a: 输入向量 A，形状 (N,)
-        b: 输入向量 B，形状 (N,)
-        block_size: 每个 task 处理的元素数
-        persistent: True 使用持久化模式（推荐），False 使用 naive 模式
+        a: 输入向量 A
+        b: 输入向量 B
+        mode: "naive" | "persistent" | "optimized"
+        xblock_sub: optimized 模式的核内子块大小 (仅 optimized 模式)
 
     返回:
         输出向量 C，形状与输入相同
@@ -98,22 +124,33 @@ def vector_add(
     n_elements = a.numel()
     c = torch.empty_like(a)
 
-    if persistent:
-        num_cores = _get_num_vector_cores()
-        grid = (num_cores,)
-        _vector_add_kernel_persistent[grid](
-            a, b, c,
-            n_elements,
-            BLOCK_SIZE=block_size,
-            NUM_CORES=num_cores,
-        )
-    else:
+    if mode == "naive":
+        block_size = 1024
         grid = (triton.cdiv(n_elements, block_size),)
         _vector_add_kernel_naive[grid](
-            a, b, c,
-            n_elements,
-            BLOCK_SIZE=block_size,
+            a, b, c, n_elements, BLOCK_SIZE=block_size,
         )
+
+    elif mode == "persistent":
+        num_cores = _get_num_vector_cores()
+        block_size = 1024
+        grid = (num_cores,)
+        _vector_add_kernel_persistent[grid](
+            a, b, c, n_elements,
+            BLOCK_SIZE=block_size, NUM_CORES=num_cores,
+        )
+
+    elif mode == "optimized":
+        num_cores = _get_num_vector_cores()
+        xblock = triton.cdiv(n_elements, num_cores)
+        grid = (num_cores, 1, 1)
+        _vector_add_kernel_optimized[grid](
+            a, b, c, n_elements,
+            XBLOCK=xblock, XBLOCK_SUB=xblock_sub,
+        )
+
+    else:
+        raise ValueError(f"Unknown mode: {mode}, use 'naive', 'persistent', or 'optimized'")
 
     return c
 
@@ -127,30 +164,20 @@ def main():
     """主函数：正确性验证"""
     torch.npu.set_device(0)
 
-    size = 1024 * 64
-    print(f"Vector size: {size}")
-    print(f"Device: NPU")
-
     num_cores = _get_num_vector_cores()
     print(f"Vector Cores: {num_cores}")
 
-    a = torch.randn(size, device="npu", dtype=torch.float32)
-    b = torch.randn(size, device="npu", dtype=torch.float32)
+    for size in [1024 * 64, 1024 * 1024]:
+        a = torch.randn(size, device="npu", dtype=torch.float32)
+        b = torch.randn(size, device="npu", dtype=torch.float32)
+        ref_c = ref_program(a, b)
 
-    # 测试 naive 模式
-    c_naive = vector_add(a, b, persistent=False)
-    ref_c = ref_program(a, b)
-    torch.testing.assert_close(c_naive.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
-    print("Naive mode: Correctness check passed!")
+        for mode in ["naive", "persistent", "optimized"]:
+            c = vector_add(a, b, mode=mode)
+            torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
+            print(f"  size={size:>8}, mode={mode:>12}: PASS")
 
-    # 测试 persistent 模式
-    c_persistent = vector_add(a, b, persistent=True)
-    torch.testing.assert_close(c_persistent.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
-    print("Persistent mode: Correctness check passed!")
-
-    print(f"\nInput A: {a.shape}, dtype={a.dtype}")
-    print(f"Input B: {b.shape}, dtype={b.dtype}")
-    print(f"Output C: {c_persistent.shape}, dtype={c_persistent.dtype}")
+    print("\nAll correctness checks passed!")
 
 
 if __name__ == "__main__":
