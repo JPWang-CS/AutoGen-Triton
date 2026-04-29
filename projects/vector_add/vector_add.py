@@ -89,7 +89,7 @@ def _vector_add_kernel_optimized(
 
 
 # ============================================================================
-# Pipelined kernel (无 mask + multibuffer 显式控制)
+# Pipelined kernel (显式 MTE2/MTE3 流水并行)
 # ============================================================================
 
 @triton.jit
@@ -99,27 +99,57 @@ def _vector_add_kernel_pipelined(
     XBLOCK_SUB: tl.constexpr,
 ):
     """
-    最大带宽模式:
-    - 无 mask: 纯连续内存访问，MTE2 可以满带宽搬运
-    - 无 n_elements 参数: 要求输入已被 pad 到对齐大小
-    - constexpr 循环 + 无 mask → 编译器生成最优流水线
+    显式三阶段流水线: Prologue → Steady State → Epilogue
 
-    无 mask 为什么快:
-    1. 避免 Vector 计算 mask (offsets < n) 的开销
-    2. 避免 MTE2 等待 Vector 填充 padding=0 的同步点
-    3. 纯连续寻址，硬件预取效率最高
+    NPU 硬件有三个独立的执行单元:
+      - MTE2: 全局内存 → UB (拷入)
+      - Vector: UB 上计算
+      - MTE3: UB → 全局内存 (拷出)
+
+    流水线目标: 让 MTE2 拷入 block N+1 与 MTE3 拷出 block N 同时执行。
+
+    结构:
+      Prologue:   MTE2 拷入 block 0
+      Steady:     Vector 计算 block i
+                  MTE2 拷入 block i+1  ← 与下面并行
+                  MTE3 拷出 block i    ← 与上面并行
+      Epilogue:   Vector 计算 block last, MTE3 拷出 block last
+
+    时序图:
+      MTE2:   [load₀] [load₁] [load₂] [load₃] ...
+      Vector:         [calc₀] [calc₁] [calc₂] ...
+      MTE3:                   [store₀][store₁][store₂]...
+                              ↑ calc₁ 和 store₀ 并行
     """
     pid = tl.program_id(0)
-    xoffset = pid * XBLOCK
+    base_offset = pid * XBLOCK
     base = tl.arange(0, XBLOCK_SUB)
     loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
 
-    for loop_idx in range(loops):
-        x_index = xoffset + loop_idx * XBLOCK_SUB + base
-        # 无 mask — 纯连续内存访问
-        a = tl.load(a_ptr + x_index)
-        b = tl.load(b_ptr + x_index)
-        tl.store(c_ptr + x_index, a + b)
+    # ---- Prologue: 预取 block 0 (MTE2 拷入) ----
+    curr_offset = base_offset + 0 * XBLOCK_SUB + base
+    a_buf = tl.load(a_ptr + curr_offset)
+    b_buf = tl.load(b_ptr + curr_offset)
+
+    # ---- Steady state: 计算 block i + 拷入 block i+1 + 拷出 block i ----
+    for i in range(loops - 1):
+        # [Vector] 计算当前块
+        c_buf = a_buf + b_buf
+
+        # [MTE2] 预取下一块 — 拷入 block i+1 (与下面的 store 并行)
+        next_offset = base_offset + (i + 1) * XBLOCK_SUB + base
+        a_buf = tl.load(a_ptr + next_offset)
+        b_buf = tl.load(b_ptr + next_offset)
+
+        # [MTE3] 写回当前块 — 拷出 block i (与上面的 load 并行)
+        tl.store(c_ptr + curr_offset, c_buf)
+
+        # 移动窗口
+        curr_offset = next_offset
+
+    # ---- Epilogue: 处理最后一块 ----
+    c_buf = a_buf + b_buf
+    tl.store(c_ptr + curr_offset, c_buf)
 
 
 # ============================================================================
