@@ -4,10 +4,14 @@ Triton-Ascend Reduce Sum
 对输入张量沿指定 axis 求和:
   output = sum(input, axis=dim)
 
-支持三种累加策略 (precision 参数):
-1. "simple":   直接 acc += tl.sum(x) — 最快，精度一般
-2. "pairwise": 分块 tl.sum(SUB_SIZE) + 直接累加 — 精度好，无补偿开销
-3. "vector":   逐元素向量累加，最后才 reduce — 零额外运算，精度优于 simple
+支持两种累加策略 (precision 参数):
+1. "simple":   直接 acc += tl.sum(x, RBLOCK) — 最快，精度一般
+2. "pairwise": 强制 RBLOCK=64 逐元素累加，最后 tl.sum(64) — 精度好
+
+  pairwise 原理 (a+b+c+d+e+f+g+h):
+    simple:   ((((a+b)+c)+d)+e)+f)+g)+h)     ← 大数吃小数
+    pairwise: (a+b)+(c+d)+(e+f)+(g+h)          ← 等量级相加
+              = col_0_sum + col_1_sum + ... + col_63_sum
 
 NPU 特殊处理:
 - 累加器始终使用 float32
@@ -20,11 +24,11 @@ import triton.runtime.driver as driver
 import torch
 
 _UB_MAX_INPUT_ELEMENTS = 12 * 1024
-_PAIRWISE_SUB = 64  # pairwise 子块大小: 每个 tl.sum 只归约 64 个元素
+_PAIRWISE_RBLOCK = 64
 
 
 # ============================================================================
-# 2D Optimized kernel — simple 累加
+# 2D Optimized kernel — simple 累加 (大块 tl.sum)
 # ============================================================================
 
 @triton.jit
@@ -60,7 +64,7 @@ def _reduce_sum_opt_simple_kernel(
 
 
 # ============================================================================
-# 2D Optimized kernel — pairwise 分块累加 (两两相加)
+# 2D Optimized kernel — pairwise (小块逐元素累加, 最后 tl.sum(64))
 # ============================================================================
 
 @triton.jit
@@ -71,51 +75,11 @@ def _reduce_sum_opt_pairwise_kernel(
     XBLOCK: tl.constexpr,
     XBLOCK_SUB: tl.constexpr,
     RBLOCK: tl.constexpr,
-    SUB_SIZE: tl.constexpr,
 ):
     """
-    Pairwise 分块: 将 RBLOCK 拆成 SUB_SIZE 子块，每块做 tl.sum 后直接累加。
-    相当于先两两相加小块 (精度高)，再把小块结果逐个累加。
+    Pairwise: RBLOCK=64, 逐元素累加到 [xsub, 64], 最后 tl.sum(64).
+    每列独立累加 → 所有列和等量级 → tl.sum 精度好.
     """
-    pid = tl.program_id(0)
-    xoffset = pid * XBLOCK
-    x_loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
-    r_loops: tl.constexpr = (n_cols + RBLOCK - 1) // RBLOCK
-    n_sub: tl.constexpr = (RBLOCK + SUB_SIZE - 1) // SUB_SIZE
-    sub_base = tl.arange(0, SUB_SIZE)
-
-    for x_loop in range(x_loops):
-        row_idx = xoffset + x_loop * XBLOCK_SUB + tl.arange(0, XBLOCK_SUB)
-        row_mask = row_idx < n_rows
-        acc = tl.zeros([XBLOCK_SUB], dtype=tl.float32)
-
-        for r_loop in range(r_loops):
-            for sub_idx in range(n_sub):
-                sub_col = r_loop * RBLOCK + sub_idx * SUB_SIZE
-                sub_rindex = sub_col + sub_base
-                sub_rmask = sub_rindex < n_cols
-                sub_ptrs = in_ptr + row_idx[:, None] * stride_in_row + sub_rindex[None, :]
-                sub_block_mask = row_mask[:, None] & sub_rmask[None, :]
-                x = tl.sum(tl.load(sub_ptrs, mask=sub_block_mask, other=0.0), axis=1).to(tl.float32)
-                acc = acc + x
-
-        tl.store(out_ptr + row_idx * stride_out_row, acc, mask=row_mask)
-
-
-# ============================================================================
-# 2D Optimized kernel — vector 累加 (逐元素向量累加, 最后才 reduce)
-# ============================================================================
-
-@triton.jit
-def _reduce_sum_opt_vector_kernel(
-    in_ptr, out_ptr,
-    n_rows, n_cols,
-    stride_in_row, stride_out_row,
-    XBLOCK: tl.constexpr,
-    XBLOCK_SUB: tl.constexpr,
-    RBLOCK: tl.constexpr,
-):
-    """逐元素向量累加: 保持 RBLOCK 维度累加，最后一步才 tl.sum 归约"""
     pid = tl.program_id(0)
     xoffset = pid * XBLOCK
     rbase = tl.arange(0, RBLOCK)
@@ -141,7 +105,7 @@ def _reduce_sum_opt_vector_kernel(
 
 
 # ============================================================================
-# Naive kernel (每行一个 program) — 三种精度
+# Naive kernels
 # ============================================================================
 
 @triton.jit
@@ -168,31 +132,6 @@ def _reduce_sum_naive_simple_kernel(
 
 @triton.jit
 def _reduce_sum_naive_pairwise_kernel(
-    in_ptr, out_ptr,
-    n_rows, n_cols,
-    stride_in_row, stride_out_row,
-    RBLOCK: tl.constexpr,
-    SUB_SIZE: tl.constexpr,
-):
-    pid = tl.program_id(0)
-    row_idx = pid
-    r_loops: tl.constexpr = (n_cols + RBLOCK - 1) // RBLOCK
-    n_sub: tl.constexpr = (RBLOCK + SUB_SIZE - 1) // SUB_SIZE
-    sub_base = tl.arange(0, SUB_SIZE)
-    acc = tl.zeros([], dtype=tl.float32)
-    for r_loop in range(r_loops):
-        for sub_idx in range(n_sub):
-            sub_col = r_loop * RBLOCK + sub_idx * SUB_SIZE
-            sub_rindex = sub_col + sub_base
-            sub_rmask = sub_rindex < n_cols
-            sub_ptrs = in_ptr + row_idx * stride_in_row + sub_rindex
-            x = tl.sum(tl.load(sub_ptrs, mask=sub_rmask, other=0.0)).to(tl.float32)
-            acc = acc + x
-    tl.store(out_ptr + row_idx * stride_out_row, acc)
-
-
-@triton.jit
-def _reduce_sum_naive_vector_kernel(
     in_ptr, out_ptr,
     n_rows, n_cols,
     stride_in_row, stride_out_row,
@@ -247,20 +186,10 @@ def _get_num_vector_cores() -> int:
     return props["num_vectorcore"]
 
 
-def _safe_rblock(n_cols: int, xblock_sub: int, element_bytes: int = 4,
-                 vector_acc: bool = False) -> int:
-    ub_limit = _UB_MAX_INPUT_ELEMENTS // (2 if vector_acc else 1)
-    max_elements = ub_limit // max(xblock_sub, 1)
+def _safe_rblock(n_cols: int, xblock_sub: int, element_bytes: int = 4) -> int:
+    max_elements = _UB_MAX_INPUT_ELEMENTS // max(xblock_sub, 1)
     rblock = triton.next_power_of_2(min(n_cols, max_elements))
     return max(rblock, 1)
-
-
-def _align_sub(rblock: int) -> int:
-    """确保 _PAIRWISE_SUB 能整除 rblock，否则向下对齐"""
-    sub = _PAIRWISE_SUB
-    while sub > 1 and rblock % sub != 0:
-        sub //= 2
-    return sub
 
 
 def reduce_sum(
@@ -276,10 +205,10 @@ def reduce_sum(
         x: 输入张量
         axis: 归约轴 (支持 -1/last axis 和 None/全量)
         mode: "naive" | "optimized"
-        precision: "simple" | "pairwise" | "vector"
-          - simple:   直接 acc += tl.sum(x)，最快，精度一般
-          - pairwise: 分块 tl.sum(64) + 累加，精度好，无补偿开销
-          - vector:   逐元素向量累加最后 reduce，零额外运算
+        precision: "simple" | "pairwise"
+          - simple:   acc += tl.sum(x, axis=1) 一次大块归约，最快
+          - pairwise: RBLOCK=64 逐元素累加 [xsub, 64]，最后 tl.sum(64)
+                      等量级相加: (a+b)+(c+d)+...
 
     返回:
         归约结果张量
@@ -324,52 +253,35 @@ def _reduce_sum_last_axis(
     element_bytes = x.element_size()
     num_cores = _get_num_vector_cores()
 
-    vector_acc = (precision == "vector")
-
     if mode == "naive":
-        rblock = _safe_rblock(n_cols, 1, element_bytes, vector_acc=vector_acc)
-
-        if precision == "simple":
+        if precision == "pairwise":
+            rblock = _PAIRWISE_RBLOCK
+            _reduce_sum_naive_pairwise_kernel[(n_rows,)](
+                x_2d, output, n_rows, n_cols,
+                x_2d.stride(0), output.stride(0),
+                RBLOCK=rblock,
+            )
+        else:
+            rblock = _safe_rblock(n_cols, 1, element_bytes)
             _reduce_sum_naive_simple_kernel[(n_rows,)](
                 x_2d, output, n_rows, n_cols,
                 x_2d.stride(0), output.stride(0),
                 RBLOCK=rblock,
             )
-        elif precision == "pairwise":
-            sub = _align_sub(rblock)
-            _reduce_sum_naive_pairwise_kernel[(n_rows,)](
-                x_2d, output, n_rows, n_cols,
-                x_2d.stride(0), output.stride(0),
-                RBLOCK=rblock, SUB_SIZE=sub,
-            )
-        elif precision == "vector":
-            _reduce_sum_naive_vector_kernel[(n_rows,)](
-                x_2d, output, n_rows, n_cols,
-                x_2d.stride(0), output.stride(0),
-                RBLOCK=rblock,
-            )
-
     else:
         xblock = triton.cdiv(n_rows, num_cores)
         xblock_sub = min(xblock, 8)
-        rblock = _safe_rblock(n_cols, xblock_sub, element_bytes, vector_acc=vector_acc)
 
-        if precision == "simple":
-            _reduce_sum_opt_simple_kernel[(num_cores, 1, 1)](
-                x_2d, output, n_rows, n_cols,
-                x_2d.stride(0), output.stride(0),
-                XBLOCK=xblock, XBLOCK_SUB=xblock_sub, RBLOCK=rblock,
-            )
-        elif precision == "pairwise":
-            sub = _align_sub(rblock)
+        if precision == "pairwise":
+            rblock = _PAIRWISE_RBLOCK
             _reduce_sum_opt_pairwise_kernel[(num_cores, 1, 1)](
                 x_2d, output, n_rows, n_cols,
                 x_2d.stride(0), output.stride(0),
                 XBLOCK=xblock, XBLOCK_SUB=xblock_sub, RBLOCK=rblock,
-                SUB_SIZE=sub,
             )
-        elif precision == "vector":
-            _reduce_sum_opt_vector_kernel[(num_cores, 1, 1)](
+        else:
+            rblock = _safe_rblock(n_cols, xblock_sub, element_bytes)
+            _reduce_sum_opt_simple_kernel[(num_cores, 1, 1)](
                 x_2d, output, n_rows, n_cols,
                 x_2d.stride(0), output.stride(0),
                 XBLOCK=xblock, XBLOCK_SUB=xblock_sub, RBLOCK=rblock,
@@ -395,7 +307,7 @@ def main():
     for name, shape, axis in tests:
         x = torch.randn(*shape, device="npu", dtype=torch.float32)
         ref = ref_program(x, axis=axis)
-        for prec in ["simple", "pairwise", "vector"]:
+        for prec in ["simple", "pairwise"]:
             result = reduce_sum(x, axis=axis, mode="optimized", precision=prec)
             diff = torch.max(torch.abs(result.cpu() - ref.cpu())).item()
             rtol = 1e-3 if "large" in name else 1e-4

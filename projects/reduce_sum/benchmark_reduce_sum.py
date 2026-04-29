@@ -3,7 +3,7 @@ Triton-Ascend Reduce Sum 性能基准测试
 
 对比维度:
   - 模式:  Naive (每行 1 program) / Optimized (XBLOCK/XBLOCK_SUB/RBLOCK)
-  - 精度:  simple (直接累加) / vector (向量累加最后 reduce) / kahan (补偿求和)
+  - 精度:  simple (直接 tl.sum 累加) / pairwise (RBLOCK=64 逐元素累加, 最后 tl.sum(64))
   - 基准:  PyTorch torch.sum()
 """
 
@@ -30,9 +30,9 @@ def ref_program(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
         x_vals=[128, 256, 512, 1024, 2048, 4096],
         x_log=False,
         line_arg="provider",
-        line_vals=["naive", "opt-simple", "opt-vector", "opt-kahan", "torch"],
-        line_names=["Naive", "Opt-Simple", "Opt-Vector", "Opt-Kahan", "PyTorch"],
-        styles=[("red", "-"), ("orange", "-"), ("blue", "-"), ("purple", "-"), ("green", "-")],
+        line_vals=["naive", "opt-simple", "opt-pairwise", "torch"],
+        line_names=["Naive", "Opt-Simple", "Opt-Pairwise", "PyTorch"],
+        styles=[("red", "-"), ("orange", "-"), ("blue", "-"), ("green", "-")],
         ylabel="GB/s",
         plot_name="reduce-sum-performance",
         args={"num_rows": 4096},
@@ -48,7 +48,7 @@ def benchmark(num_rows, num_cols, provider):
         )
     elif provider == "naive":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: reduce_sum(x, axis=-1, mode="naive", precision="vector"),
+            lambda: reduce_sum(x, axis=-1, mode="naive", precision="pairwise"),
             quantiles=quantiles,
         )
     elif provider == "opt-simple":
@@ -56,14 +56,9 @@ def benchmark(num_rows, num_cols, provider):
             lambda: reduce_sum(x, axis=-1, mode="optimized", precision="simple"),
             quantiles=quantiles,
         )
-    elif provider == "opt-vector":
+    elif provider == "opt-pairwise":
         ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: reduce_sum(x, axis=-1, mode="optimized", precision="vector"),
-            quantiles=quantiles,
-        )
-    elif provider == "opt-kahan":
-        ms, min_ms, max_ms = triton.testing.do_bench(
-            lambda: reduce_sum(x, axis=-1, mode="optimized", precision="kahan"),
+            lambda: reduce_sum(x, axis=-1, mode="optimized", precision="pairwise"),
             quantiles=quantiles,
         )
 
@@ -89,10 +84,9 @@ def run_comparison_benchmark(
 
     quantiles = [0.5, 0.2, 0.8]
     variants = [
-        ("Naive",       "naive",     "vector"),
-        ("Opt-Simple",  "optimized", "simple"),
-        ("Opt-Vector",  "optimized", "vector"),
-        ("Opt-Kahan",   "optimized", "kahan"),
+        ("Naive",         "naive",     "pairwise"),
+        ("Opt-Simple",    "optimized", "simple"),
+        ("Opt-Pairwise",  "optimized", "pairwise"),
     ]
 
     # 性能
@@ -115,8 +109,8 @@ def run_comparison_benchmark(
     print(f"  Reduce Sum Benchmark  |  ({num_rows}, {num_cols})  |  dtype={dtype_name}")
     print("=" * 85)
 
-    print(f"\n  {'模式':<14} {'延迟(ms)':>10} {'带宽(GB/s)':>12} {'vs PyTorch':>12} {'Diff':>12}")
-    print(f"  {'-'*60}")
+    print(f"\n  {'模式':<16} {'延迟(ms)':>10} {'带宽(GB/s)':>12} {'vs PyTorch':>12} {'Diff':>12}")
+    print(f"  {'-'*62}")
 
     for label, mode, prec in variants:
         ms = results[label]
@@ -124,22 +118,22 @@ def run_comparison_benchmark(
         sp = ms_torch / ms
         c = reduce_sum(x, axis=-1, mode=mode, precision=prec)
         diff = torch.max(torch.abs(c.cpu().float() - ref_program(x).cpu().float())).item()
-        print(f"  {label:<14} {ms:>10.4f} {bw:>12.1f} {sp:>11.3f}x {diff:>12.2e}")
+        print(f"  {label:<16} {ms:>10.4f} {bw:>12.1f} {sp:>11.3f}x {diff:>12.2e}")
 
     bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
-    print(f"  {'PYTORCH':<14} {ms_torch:>10.4f} {bw_torch:>12.1f} {'1.000x':>12} {'0.00e+00':>12}")
+    print(f"  {'PYTORCH':<16} {ms_torch:>10.4f} {bw_torch:>12.1f} {'1.000x':>12} {'0.00e+00':>12}")
 
     # 精度策略对比
     ref_cpu = ref_program(x).cpu().float()
     print(f"\n  精度策略对比:")
-    print(f"  {'策略':<14} {'MaxDiff':>12} {'MeanDiff':>12} {'Pass':>6}")
-    print(f"  {'-'*44}")
+    print(f"  {'策略':<16} {'MaxDiff':>12} {'MeanDiff':>12} {'Pass':>6}")
+    print(f"  {'-'*46}")
     for label, mode, prec in variants:
         c = reduce_sum(x, axis=-1, mode=mode, precision=prec).cpu().float()
         max_d = torch.max(torch.abs(c - ref_cpu)).item()
         mean_d = torch.mean(torch.abs(c - ref_cpu)).item()
         passed = torch.allclose(c, ref_cpu, rtol=1e-3, atol=1e-3)
-        print(f"  {label:<14} {max_d:>12.2e} {mean_d:>12.2e} {'OK' if passed else 'FAIL':>6}")
+        print(f"  {label:<16} {max_d:>12.2e} {mean_d:>12.2e} {'OK' if passed else 'FAIL':>6}")
 
     print("=" * 85)
 
@@ -158,63 +152,57 @@ def run_sweep_benchmark(
         torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
     }.get(dtype, str(dtype))
 
-    print("\n" + "=" * 120)
+    print("\n" + "=" * 110)
     print(f"  Reduce Sum Sweep  |  dtype={dtype_name}")
-    print("=" * 120)
-    print(f"  {'Shape':>14} | {'Simple':>8} {'Vector':>8} {'Kahan':>8} {'Torch':>8} | "
-          f"{'Vec BW':>7} | {'Vec/Torch':>9} {'Kah/Simple':>10} | {'VecDiff':>10} {'KahDiff':>10} | {'Pass':>4}")
-    print(f"  {'-'*116}")
+    print("=" * 110)
+    print(f"  {'Shape':>14} | {'Simple':>8} {'Pairwise':>8} {'Torch':>8} | "
+          f"{'PW BW':>7} | {'PW/Torch':>9} {'PW/Simple':>10} | {'SimDiff':>10} {'PWDiff':>10} | {'Pass':>4}")
+    print(f"  {'-'*106}")
 
     results = []
     for rows, cols in shapes:
         x = torch.randn(rows, cols, device="npu", dtype=dtype)
         ref_cpu = ref_program(x).cpu().float()
 
-        # 三种精度
         ms_simple, _, _ = triton.testing.do_bench(
             lambda: reduce_sum(x, axis=-1, mode="optimized", precision="simple"),
             quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep,
         )
-        ms_vector, _, _ = triton.testing.do_bench(
-            lambda: reduce_sum(x, axis=-1, mode="optimized", precision="vector"),
-            quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep,
-        )
-        ms_kahan, _, _ = triton.testing.do_bench(
-            lambda: reduce_sum(x, axis=-1, mode="optimized", precision="kahan"),
+        ms_pairwise, _, _ = triton.testing.do_bench(
+            lambda: reduce_sum(x, axis=-1, mode="optimized", precision="pairwise"),
             quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep,
         )
         ms_torch, _, _ = triton.testing.do_bench(
             lambda: ref_program(x), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep,
         )
 
-        # 精度
-        c_vec = reduce_sum(x, axis=-1, mode="optimized", precision="vector").cpu().float()
-        c_kah = reduce_sum(x, axis=-1, mode="optimized", precision="kahan").cpu().float()
-        diff_vec = torch.max(torch.abs(c_vec - ref_cpu)).item()
-        diff_kah = torch.max(torch.abs(c_kah - ref_cpu)).item()
-        pass_vec = torch.allclose(c_vec, ref_cpu, rtol=1e-3, atol=1e-3)
-        pass_kah = torch.allclose(c_kah, ref_cpu, rtol=1e-3, atol=1e-3)
+        c_sim = reduce_sum(x, axis=-1, mode="optimized", precision="simple").cpu().float()
+        c_pw = reduce_sum(x, axis=-1, mode="optimized", precision="pairwise").cpu().float()
+        diff_sim = torch.max(torch.abs(c_sim - ref_cpu)).item()
+        diff_pw = torch.max(torch.abs(c_pw - ref_cpu)).item()
+        pass_sim = torch.allclose(c_sim, ref_cpu, rtol=1e-3, atol=1e-3)
+        pass_pw = torch.allclose(c_pw, ref_cpu, rtol=1e-3, atol=1e-3)
 
         bytes_moved = (rows * cols + rows) * element_bytes
-        bw_vec = bytes_moved / (ms_vector * 1e-6) * 1e-9
-        sp_vec_torch = ms_torch / ms_vector
-        sp_kah_simple = ms_simple / ms_kahan
-        pass_str = "OK" if (pass_vec and pass_kah) else "FAIL"
+        bw_pw = bytes_moved / (ms_pairwise * 1e-6) * 1e-9
+        sp_pw_torch = ms_torch / ms_pairwise
+        sp_pw_simple = ms_simple / ms_pairwise
+        pass_str = "OK" if (pass_sim and pass_pw) else "FAIL"
 
-        print(f"  ({rows:>4}, {cols:>4})   | {ms_simple:>7.3f}  {ms_vector:>7.3f}  {ms_kahan:>7.3f}  {ms_torch:>7.3f} | "
-              f"{bw_vec:>6.1f}  | {sp_vec_torch:>8.3f}x {sp_kah_simple:>9.3f}x | "
-              f"{diff_vec:>10.2e} {diff_kah:>10.2e} | {pass_str:>4}")
+        print(f"  ({rows:>4}, {cols:>4})   | {ms_simple:>7.3f}  {ms_pairwise:>7.3f}  {ms_torch:>7.3f} | "
+              f"{bw_pw:>6.1f}  | {sp_pw_torch:>8.3f}x {sp_pw_simple:>9.3f}x | "
+              f"{diff_sim:>10.2e} {diff_pw:>10.2e} | {pass_str:>4}")
         results.append({
-            "sp_vec_torch": sp_vec_torch, "sp_kah_simple": sp_kah_simple,
-            "pass": pass_vec and pass_kah,
+            "sp_pw_torch": sp_pw_torch, "sp_pw_simple": sp_pw_simple,
+            "pass": pass_sim and pass_pw,
         })
 
-    print("=" * 120)
+    print("=" * 110)
     all_pass = all(r["pass"] for r in results)
-    avg_vec_torch = sum(r["sp_vec_torch"] for r in results) / len(results)
-    avg_kah_simple = sum(r["sp_kah_simple"] for r in results) / len(results)
+    avg_pw_torch = sum(r["sp_pw_torch"] for r in results) / len(results)
+    avg_pw_simple = sum(r["sp_pw_simple"] for r in results) / len(results)
     print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}")
-    print(f"  平均:  Vector vs PyTorch={avg_vec_torch:.3f}x  |  Kahan vs Simple 开销={1/avg_kah_simple:.2f}x")
+    print(f"  平均:  Pairwise vs PyTorch={avg_pw_torch:.3f}x  |  Pairwise vs Simple 开销={1/avg_pw_simple:.2f}x")
 
 
 def main():
