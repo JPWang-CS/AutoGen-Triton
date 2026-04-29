@@ -6,12 +6,12 @@ Triton-Ascend Reduce Sum
 
 支持两种累加策略 (precision 参数):
 1. "simple":   直接 acc += tl.sum(x, RBLOCK) — 最快，精度一般
-2. "pairwise": 强制 RBLOCK=64 逐元素累加，最后 tl.sum(64) — 精度好
+2. "pairwise": RBLOCK=8 逐元素累加到 [xsub, 8]，最后 tl.sum(8) — 精度好
 
   pairwise 原理 (a+b+c+d+e+f+g+h):
     simple:   ((((a+b)+c)+d)+e)+f)+g)+h)     ← 大数吃小数
     pairwise: (a+b)+(c+d)+(e+f)+(g+h)          ← 等量级相加
-              = col_0_sum + col_1_sum + ... + col_63_sum
+              = col_0_sum + col_1_sum + ... + col_7_sum
 
 NPU 特殊处理:
 - 累加器始终使用 float32
@@ -24,7 +24,7 @@ import triton.runtime.driver as driver
 import torch
 
 _UB_MAX_INPUT_ELEMENTS = 12 * 1024
-_PAIRWISE_RBLOCK = 64
+_PAIRWISE_RBLOCK = 8
 
 
 # ============================================================================
@@ -64,7 +64,7 @@ def _reduce_sum_opt_simple_kernel(
 
 
 # ============================================================================
-# 2D Optimized kernel — pairwise (小块逐元素累加, 最后 tl.sum(64))
+# 2D Optimized kernel — pairwise (小块逐元素累加, 最后 tl.sum(8))
 # ============================================================================
 
 @triton.jit
@@ -77,8 +77,8 @@ def _reduce_sum_opt_pairwise_kernel(
     RBLOCK: tl.constexpr,
 ):
     """
-    Pairwise: RBLOCK=64, 逐元素累加到 [xsub, 64], 最后 tl.sum(64).
-    每列独立累加 → 所有列和等量级 → tl.sum 精度好.
+    Pairwise: RBLOCK=8, 逐元素累加到 [xsub, 8], 最后 tl.sum(8).
+    每 8 个元素为一组，各列独立累加 → 最后 8 个等量级列和相加 → 精度好.
     """
     pid = tl.program_id(0)
     xoffset = pid * XBLOCK
@@ -207,7 +207,7 @@ def reduce_sum(
         mode: "naive" | "optimized"
         precision: "simple" | "pairwise"
           - simple:   acc += tl.sum(x, axis=1) 一次大块归约，最快
-          - pairwise: RBLOCK=64 逐元素累加 [xsub, 64]，最后 tl.sum(64)
+          - pairwise: RBLOCK=8 逐元素累加 [xsub, 8]，最后 tl.sum(8)
                       等量级相加: (a+b)+(c+d)+...
 
     返回:
