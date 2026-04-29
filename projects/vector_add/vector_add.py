@@ -1,19 +1,19 @@
 """
 Triton-Ascend 向量加法 (Vector Add)
 
-三种实现模式：
-1. naive:    GPU 风格，每个 program 一段连续元素，grid 数量远超物理核数
-2. persistent: 固定核数 + tl.range 跨步分配（解决了调度问题，但循环不是 constexpr）
-3. optimized: 官方推荐 XBLOCK/XBLOCK_SUB 双层切分 + constexpr 循环 + 无 mask
-   （编译器可展开循环 → 开启 multibuffer 存算并行流水线）
+四种实现模式:
+1. naive:     GPU 风格，每个 program 一段连续元素，grid 数量远超物理核数
+2. persistent: 固定核数 + tl.range 跨步分配（循环非 constexpr）
+3. optimized: XBLOCK/XBLOCK_SUB 双层切分 + constexpr 循环（编译器可展开流水线）
+4. pipelined: optimized + 显式 multibuffer 控制 + 无 mask（最大带宽模式）
 
-性能排序: optimized >> persistent ≈ naive >> ...
+流水线原理 (multibuffer):
+  编译器看到 constexpr 循环时，自动将 UB 分为多个缓冲区，
+  使"拷入 N+1"与"计算 N"与"拷出 N-1"并行执行:
 
-关键优化点:
-- loops: tl.constexpr 使编译器能在编译期确定循环次数，展开并启用 multibuffer
-- XBLOCK 核间切分 + XBLOCK_SUB 核内子块循环 = 三层切分
-- mask=None 或 care_padding=False 避免填充同步开销
-- grid = (ncore, 1, 1) 三维格式
+  MTE2:   [load₀] [load₁] [load₂] [load₃] ...
+  Vector:         [calc₀] [calc₁] [calc₂] ...
+  MTE2:                  [store₀] [store₁] [store₂] ...
 """
 
 import triton
@@ -41,7 +41,7 @@ def _vector_add_kernel_naive(
 
 
 # ============================================================================
-# Persistent kernel (固定核数 + tl.range，但循环非 constexpr)
+# Persistent kernel (固定核数 + tl.range，循环非 constexpr)
 # ============================================================================
 
 @triton.jit
@@ -61,7 +61,7 @@ def _vector_add_kernel_persistent(
 
 
 # ============================================================================
-# Optimized kernel (官方 XBLOCK/XBLOCK_SUB 模式，constexpr 循环)
+# Optimized kernel (XBLOCK/XBLOCK_SUB constexpr 循环)
 # ============================================================================
 
 @triton.jit
@@ -72,11 +72,8 @@ def _vector_add_kernel_optimized(
     XBLOCK_SUB: tl.constexpr,
 ):
     """
-    官方推荐的 NPU 纯向量算子模式:
-    - 核间切分: 每个 core 连续处理 XBLOCK 个元素
-    - 核内子块: 每次 XBLOCK_SUB 个元素，循环处理
-    - loops: tl.constexpr → 编译器可展开 → multibuffer 流水线生效
-    - mask 仅在尾部不整除时触发
+    constexpr 循环 → 编译器展开 → multibuffer 流水线自动生效
+    mask 在尾部块起保护作用
     """
     pid = tl.program_id(0)
     xoffset = pid * XBLOCK
@@ -92,14 +89,53 @@ def _vector_add_kernel_optimized(
 
 
 # ============================================================================
+# Pipelined kernel (无 mask + multibuffer 显式控制)
+# ============================================================================
+
+@triton.jit
+def _vector_add_kernel_pipelined(
+    a_ptr, b_ptr, c_ptr,
+    XBLOCK: tl.constexpr,
+    XBLOCK_SUB: tl.constexpr,
+):
+    """
+    最大带宽模式:
+    - 无 mask: 纯连续内存访问，MTE2 可以满带宽搬运
+    - 无 n_elements 参数: 要求输入已被 pad 到对齐大小
+    - constexpr 循环 + 无 mask → 编译器生成最优流水线
+
+    无 mask 为什么快:
+    1. 避免 Vector 计算 mask (offsets < n) 的开销
+    2. 避免 MTE2 等待 Vector 填充 padding=0 的同步点
+    3. 纯连续寻址，硬件预取效率最高
+    """
+    pid = tl.program_id(0)
+    xoffset = pid * XBLOCK
+    base = tl.arange(0, XBLOCK_SUB)
+    loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
+
+    for loop_idx in range(loops):
+        x_index = xoffset + loop_idx * XBLOCK_SUB + base
+        # 无 mask — 纯连续内存访问
+        a = tl.load(a_ptr + x_index)
+        b = tl.load(b_ptr + x_index)
+        tl.store(c_ptr + x_index, a + b)
+
+
+# ============================================================================
 # Host 函数
 # ============================================================================
 
 def _get_num_vector_cores() -> int:
-    """获取 NPU Vector Core 数量"""
     device = torch.npu.current_device()
     props = driver.active.utils.get_device_properties(device)
     return props["num_vectorcore"]
+
+
+def _align_size(n: int, num_cores: int, xblock_sub: int) -> int:
+    """将 size 向上对齐到 num_cores * xblock_sub 的倍数"""
+    alignment = num_cores * xblock_sub
+    return ((n + alignment - 1) // alignment) * alignment
 
 
 def vector_add(
@@ -114,54 +150,77 @@ def vector_add(
     参数:
         a: 输入向量 A
         b: 输入向量 B
-        mode: "naive" | "persistent" | "optimized"
-        xblock_sub: optimized 模式的核内子块大小 (仅 optimized 模式)
+        mode: "naive" | "persistent" | "optimized" | "pipelined"
+        xblock_sub: 核内子块大小
 
     返回:
         输出向量 C，形状与输入相同
     """
     assert a.shape == b.shape, "Input shapes must match"
     n_elements = a.numel()
-    c = torch.empty_like(a)
 
     if mode == "naive":
         block_size = 1024
+        c = torch.empty_like(a)
         grid = (triton.cdiv(n_elements, block_size),)
         _vector_add_kernel_naive[grid](
             a, b, c, n_elements, BLOCK_SIZE=block_size,
         )
+        return c
 
     elif mode == "persistent":
         num_cores = _get_num_vector_cores()
         block_size = 1024
+        c = torch.empty_like(a)
         grid = (num_cores,)
         _vector_add_kernel_persistent[grid](
             a, b, c, n_elements,
             BLOCK_SIZE=block_size, NUM_CORES=num_cores,
         )
+        return c
 
     elif mode == "optimized":
         num_cores = _get_num_vector_cores()
         xblock = triton.cdiv(n_elements, num_cores)
+        c = torch.empty_like(a)
         grid = (num_cores, 1, 1)
         _vector_add_kernel_optimized[grid](
             a, b, c, n_elements,
             XBLOCK=xblock, XBLOCK_SUB=xblock_sub,
         )
+        return c
+
+    elif mode == "pipelined":
+        num_cores = _get_num_vector_cores()
+        n_padded = _align_size(n_elements, num_cores, xblock_sub)
+        xblock = n_padded // num_cores
+
+        # Pad input to aligned size (extra bytes are uninitialized but won't be used)
+        if n_padded > n_elements:
+            a_pad = torch.empty(n_padded, device=a.device, dtype=a.dtype)
+            a_pad[:n_elements] = a
+            b_pad = torch.empty(n_padded, device=b.device, dtype=b.dtype)
+            b_pad[:n_elements] = b
+            c_pad = torch.empty(n_padded, device=a.device, dtype=a.dtype)
+        else:
+            a_pad, b_pad, c_pad = a, b, torch.empty_like(a)
+
+        grid = (num_cores, 1, 1)
+        _vector_add_kernel_pipelined[grid](
+            a_pad, b_pad, c_pad,
+            XBLOCK=xblock, XBLOCK_SUB=xblock_sub,
+        )
+        return c_pad[:n_elements].reshape(a.shape)
 
     else:
-        raise ValueError(f"Unknown mode: {mode}, use 'naive', 'persistent', or 'optimized'")
-
-    return c
+        raise ValueError(f"Unknown mode: {mode}")
 
 
 def ref_program(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
-    """PyTorch 参考实现"""
     return a + b
 
 
 def main():
-    """主函数：正确性验证"""
     torch.npu.set_device(0)
 
     num_cores = _get_num_vector_cores()
@@ -172,7 +231,7 @@ def main():
         b = torch.randn(size, device="npu", dtype=torch.float32)
         ref_c = ref_program(a, b)
 
-        for mode in ["naive", "persistent", "optimized"]:
+        for mode in ["naive", "persistent", "optimized", "pipelined"]:
             c = vector_add(a, b, mode=mode)
             torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
             print(f"  size={size:>8}, mode={mode:>12}: PASS")
