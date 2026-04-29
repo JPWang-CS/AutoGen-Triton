@@ -247,8 +247,15 @@ def _get_num_vector_cores() -> int:
     return props["num_vectorcore"]
 
 
-def _safe_rblock(n_cols: int, xblock_sub: int, element_bytes: int = 4) -> int:
-    max_elements = _UB_MAX_INPUT_ELEMENTS // max(xblock_sub, 1)
+def _safe_rblock(n_cols: int, xblock_sub: int, element_bytes: int = 4,
+                 vector_acc: bool = False) -> int:
+    """计算安全的 RBLOCK.
+
+    vector_acc=True 时累加器是 [xsub, RBLOCK] 而非 [xsub]，UB 占用翻倍，
+    需要将 RBLOCK 上限减半。
+    """
+    ub_limit = _UB_MAX_INPUT_ELEMENTS // (2 if vector_acc else 1)
+    max_elements = ub_limit // max(xblock_sub, 1)
     rblock = triton.next_power_of_2(min(n_cols, max_elements))
     return max(rblock, 1)
 
@@ -328,8 +335,10 @@ def _reduce_sum_last_axis(
     if kernel is None:
         raise ValueError(f"Unknown mode/precision: {mode}/{precision}")
 
+    vector_acc = (precision == "vector")
+
     if mode == "naive":
-        rblock = _safe_rblock(n_cols, 1, element_bytes)
+        rblock = _safe_rblock(n_cols, 1, element_bytes, vector_acc=vector_acc)
         kernel[(n_rows,)](
             x_2d, output, n_rows, n_cols,
             x_2d.stride(0), output.stride(0),
@@ -338,7 +347,7 @@ def _reduce_sum_last_axis(
     else:
         xblock = triton.cdiv(n_rows, num_cores)
         xblock_sub = min(xblock, 8)
-        rblock = _safe_rblock(n_cols, xblock_sub, element_bytes)
+        rblock = _safe_rblock(n_cols, xblock_sub, element_bytes, vector_acc=vector_acc)
         kernel[(num_cores, 1, 1)](
             x_2d, output, n_rows, n_cols,
             x_2d.stride(0), output.stride(0),
