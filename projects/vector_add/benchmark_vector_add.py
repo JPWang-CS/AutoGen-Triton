@@ -4,13 +4,13 @@ Triton-Ascend 向量加法性能基准测试
 四路对比：
   - Naive:     GPU 风格 grid，大量 program
   - Persistent: 固定核数 tl.range 跨步
-  - Optimized: XBLOCK/XBLOCK_SUB constexpr 循环 + mask
+  - Optimized: XBLOCK/XBLOCK_SUB constexpr 循环 + UB 最优 block
   - PyTorch:   原生 a + b
 
 性能指标:
   - 执行时间 (ms)
   - 带宽 (GB/s)
-  - 加速比
+  - 各方法间加速比
   - 数值精度 (rtol=1e-3, atol=1e-3)
 """
 
@@ -108,10 +108,10 @@ def run_comparison_benchmark(
 
     bytes_moved = 3 * size * element_bytes
 
-    print("\n" + "=" * 75)
+    print("\n" + "=" * 80)
     print(f"  Vector Add Benchmark  |  size={size:,}  |  dtype={dtype_name}")
     print(f"  数据量: {size * element_bytes / 1024 / 1024:.2f} MB per tensor")
-    print("=" * 75)
+    print("=" * 80)
 
     print(f"\n  {'模式':<14} {'延迟(ms)':>10} {'带宽(GB/s)':>12} {'vs PyTorch':>12}")
     print(f"  {'-'*48}")
@@ -125,10 +125,15 @@ def run_comparison_benchmark(
     bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
     print(f"  {'PYTORCH':<14} {ms_torch:>10.4f} {bw_torch:>12.1f} {'1.000x':>12}")
 
-    opt_speedup = results["naive"]["ms"] / results["optimized"]["ms"]
-    print(f"\n  Optimized vs Naive: {opt_speedup:.2f}x")
-    print(f"  精度 (rtol=1e-3): {'PASS' if precision_pass else 'FAIL'}, max_diff={max_diff:.2e}")
-    print("=" * 75)
+    print(f"\n  各优化阶段提升:")
+    ms_naive = results["naive"]["ms"]
+    ms_persist = results["persistent"]["ms"]
+    ms_opt = results["optimized"]["ms"]
+    print(f"    Naive → Persistent (固定核数):   {ms_naive / ms_persist:.2f}x")
+    print(f"    Persistent → Optimized (UB最优):  {ms_persist / ms_opt:.2f}x")
+    print(f"    Naive → Optimized (总体提升):     {ms_naive / ms_opt:.2f}x")
+    print(f"\n  精度 (rtol=1e-3): {'PASS' if precision_pass else 'FAIL'}, max_diff={max_diff:.2e}")
+    print("=" * 80)
 
 
 # ============================================================================
@@ -149,12 +154,12 @@ def run_sweep_benchmark(
         torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
     }.get(dtype, str(dtype))
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 110)
     print(f"  Vector Add Sweep  |  dtype={dtype_name}")
-    print("=" * 90)
-    print(f"  {'Size':>10} | {'Naive':>8} {'Optim':>8} {'Torch':>8} | "
-          f"{'Optim BW':>9} | {'Speedup':>7} | {'Diff':>10} | {'Pass':>4}")
-    print(f"  {'-'*86}")
+    print("=" * 110)
+    print(f"  {'Size':>10} | {'Naive':>8} {'Persist':>8} {'Optim':>8} {'Torch':>8} | "
+          f"{'Opt BW':>7} | {'Opt/Torch':>9} {'Opt/Naive':>9} {'Pst/Naive':>9} | {'Diff':>10} | {'Pass':>4}")
+    print(f"  {'-'*106}")
 
     results = []
     for size in sizes:
@@ -171,6 +176,9 @@ def run_sweep_benchmark(
         ms_naive, _, _ = triton.testing.do_bench(
             lambda: vector_add(a, b, mode="naive"), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
         )
+        ms_persist, _, _ = triton.testing.do_bench(
+            lambda: vector_add(a, b, mode="persistent"), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
+        )
         ms_opt, _, _ = triton.testing.do_bench(
             lambda: vector_add(a, b, mode="optimized"), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
         )
@@ -180,18 +188,26 @@ def run_sweep_benchmark(
 
         bytes_moved = 3 * size * element_bytes
         bw_opt = bytes_moved / (ms_opt * 1e-6) * 1e-9
-        speedup = ms_torch / ms_opt
+        sp_opt_torch = ms_torch / ms_opt
+        sp_opt_naive = ms_naive / ms_opt
+        sp_pst_naive = ms_naive / ms_persist
         size_str = f"{size//1024}K" if size < 1024*1024 else f"{size//1024//1024}M"
         pass_str = "OK" if precision_pass else "FAIL"
 
-        print(f"  {size_str:>10} | {ms_naive:>7.3f}  {ms_opt:>7.3f}  {ms_torch:>7.3f} | "
-              f"{bw_opt:>8.1f}  | {speedup:>6.3f}x | {max_diff:>10.2e} | {pass_str:>4}")
-        results.append({"speedup": speedup, "pass": precision_pass})
+        print(f"  {size_str:>10} | {ms_naive:>7.3f}  {ms_persist:>7.3f}  {ms_opt:>7.3f}  {ms_torch:>7.3f} | "
+              f"{bw_opt:>6.1f}  | {sp_opt_torch:>8.3f}x {sp_opt_naive:>8.3f}x {sp_pst_naive:>8.3f}x | {max_diff:>10.2e} | {pass_str:>4}")
+        results.append({
+            "sp_opt_torch": sp_opt_torch, "sp_opt_naive": sp_opt_naive,
+            "sp_pst_naive": sp_pst_naive, "pass": precision_pass,
+        })
 
-    print("=" * 90)
+    print("=" * 110)
     all_pass = all(r["pass"] for r in results)
-    avg_sp = sum(r["speedup"] for r in results) / len(results)
-    print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}  |  Optimized 平均加速 vs PyTorch: {avg_sp:.3f}x")
+    avg_opt_torch = sum(r["sp_opt_torch"] for r in results) / len(results)
+    avg_opt_naive = sum(r["sp_opt_naive"] for r in results) / len(results)
+    avg_pst_naive = sum(r["sp_pst_naive"] for r in results) / len(results)
+    print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}")
+    print(f"  平均提升:  Optimized vs PyTorch={avg_opt_torch:.3f}x  |  Optimized vs Naive={avg_opt_naive:.2f}x  |  Persistent vs Naive={avg_pst_naive:.2f}x")
 
 
 def main():

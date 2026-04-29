@@ -134,12 +134,12 @@ def run_sweep_benchmark(
         torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
     }.get(dtype, str(dtype))
 
-    print("\n" + "=" * 90)
+    print("\n" + "=" * 100)
     print(f"  Reduce Sum Sweep  |  dtype={dtype_name}")
-    print("=" * 90)
+    print("=" * 100)
     print(f"  {'Shape':>14} | {'Naive':>8} {'Optim':>8} {'Torch':>8} | "
-          f"{'Optim BW':>9} | {'Speedup':>7} | {'Diff':>10} | {'Pass':>4}")
-    print(f"  {'-'*86}")
+          f"{'Opt BW':>7} | {'Opt/Torch':>9} {'Opt/Naive':>9} | {'Diff':>10} | {'Pass':>4}")
+    print(f"  {'-'*96}")
 
     results = []
     for rows, cols in shapes:
@@ -161,17 +161,20 @@ def run_sweep_benchmark(
 
         bytes_moved = (rows * cols + rows) * element_bytes
         bw_opt = bytes_moved / (ms_opt * 1e-6) * 1e-9
-        speedup = ms_torch / ms_opt
+        sp_opt_torch = ms_torch / ms_opt
+        sp_opt_naive = ms_naive / ms_opt
         pass_str = "OK" if precision_pass else "FAIL"
 
         print(f"  ({rows:>4}, {cols:>4})   | {ms_naive:>7.3f}  {ms_opt:>7.3f}  {ms_torch:>7.3f} | "
-              f"{bw_opt:>8.1f}  | {speedup:>6.3f}x | {max_diff:>10.2e} | {pass_str:>4}")
-        results.append({"speedup": speedup, "pass": precision_pass})
+              f"{bw_opt:>6.1f}  | {sp_opt_torch:>8.3f}x {sp_opt_naive:>8.3f}x | {max_diff:>10.2e} | {pass_str:>4}")
+        results.append({"sp_opt_torch": sp_opt_torch, "sp_opt_naive": sp_opt_naive, "pass": precision_pass})
 
-    print("=" * 90)
+    print("=" * 100)
     all_pass = all(r["pass"] for r in results)
-    avg_sp = sum(r["speedup"] for r in results) / len(results)
-    print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}  |  Optimized 平均加速 vs PyTorch: {avg_sp:.3f}x")
+    avg_sp_torch = sum(r["sp_opt_torch"] for r in results) / len(results)
+    avg_sp_naive = sum(r["sp_opt_naive"] for r in results) / len(results)
+    print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}")
+    print(f"  平均提升:  Optimized vs PyTorch={avg_sp_torch:.3f}x  |  Optimized vs Naive={avg_sp_naive:.2f}x")
 
 
 def main():
