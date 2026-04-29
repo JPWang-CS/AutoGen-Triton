@@ -5,18 +5,17 @@ Triton-Ascend Reduce Sum
   output = sum(input, axis=dim)
 
 支持两种模式:
-1. naive:      简单实现，每行一个 program
-2. optimized:  XBLOCK/XBLOCK_SUB/RBLOCK 三层切分 + constexpr 循环 (NPU 推荐)
+1. naive:     每行一个 program，简单直接
+2. optimized: XBLOCK/XBLOCK_SUB/RBLOCK 三层切分 + constexpr 循环
 
 UB 安全:
-- RBLOCK 受 UB 容量限制 (192KB / doublebuffer = 96KB 可用)
-- 当 reduce axis 过长时，自动分块累加
-- 1D 全量 sum 使用多核 + 子块循环模式
+- doublebuffer 后可用 96KB (192KB / 2)
+- RBLOCK 自动限制在 UB 容量内
+- n_cols > RBLOCK 时自动分块 constexpr r_loops 累加
 
 NPU 特殊处理:
-- bfloat16 输入需要 .to(tl.float32) 后再 sum
-- bool 必须转 float32 后再 sum
-- float16 可以直接 sum
+- 累加器始终使用 float32
+- bfloat16 输入需 .to(tl.float32) 再 reduce
 """
 
 import triton
@@ -24,13 +23,13 @@ import triton.language as tl
 import triton.runtime.driver as driver
 import torch
 
-# UB 安全阈值: 192KB, doublebuffer 后可用 ~96KB, float32=4B
-# 留一半给输入/输出缓冲区 → 单个输入块最大 ~24K float32 元素
-_UB_MAX_ELEMENTS = 24 * 1024
+# UB 安全阈值: 192KB, doublebuffer 后 ~96KB
+# 留一半给输出/中间 buffer → 单次输入块最大 ~12K float32 元素
+_UB_MAX_INPUT_ELEMENTS = 12 * 1024
 
 
 # ============================================================================
-# 1D 全量 sum (多核 + 子块循环)
+# 1D 全量 sum (多核部分和)
 # ============================================================================
 
 @triton.jit
@@ -40,10 +39,7 @@ def _reduce_sum_1d_kernel(
     XBLOCK: tl.constexpr,
     XBLOCK_SUB: tl.constexpr,
 ):
-    """
-    1D 全量 sum: 多核并行，每个 core 处理一段连续元素并累加到本地，
-    最终写回一个部分和。host 端再做一次小规模 reduce 得到最终结果。
-    """
+    """多核并行部分和，host 端汇总"""
     pid = tl.program_id(0)
     xoffset = pid * XBLOCK
     base = tl.arange(0, XBLOCK_SUB)
@@ -56,17 +52,16 @@ def _reduce_sum_1d_kernel(
         x = tl.load(in_ptr + x_index, mask=mask, other=0.0)
         acc = acc + x.to(tl.float32)
 
-    # 每个 core 输出一个部分和
     partial_sum = tl.sum(acc)
     tl.store(out_ptr + pid, partial_sum)
 
 
 # ============================================================================
-# 2D Pointwise-Reduction (沿 last axis sum，多核并行)
+# 2D Optimized kernel (XBLOCK/XBLOCK_SUB/RBLOCK + constexpr r_loops)
 # ============================================================================
 
 @triton.jit
-def _reduce_sum_last_axis_kernel(
+def _reduce_sum_last_axis_opt_kernel(
     in_ptr, out_ptr,
     n_rows, n_cols,
     stride_in_row, stride_out_row,
@@ -75,24 +70,22 @@ def _reduce_sum_last_axis_kernel(
     RBLOCK: tl.constexpr,
 ):
     """
-    Pointwise-Reduction 模式:
-    - 沿 last axis (axis=-1) 做 sum
-    - 每个 core 处理若干行
-    - 当 n_cols > RBLOCK 时，reduce axis 需要分块循环累加
+    Optimized: constexpr x_loops + constexpr r_loops + float32 累加器
     """
     pid = tl.program_id(0)
     xoffset = pid * XBLOCK
     rbase = tl.arange(0, RBLOCK)
 
-    loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
-    r_loops: tl.constexpr = (triton.cdiv(n_cols, RBLOCK))
+    x_loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
+    r_loops: tl.constexpr = (n_cols + RBLOCK - 1) // RBLOCK
 
-    for loop_idx in range(loops):
-        row_idx = xoffset + loop_idx * XBLOCK_SUB + tl.arange(0, XBLOCK_SUB)
+    for x_loop in range(x_loops):
+        row_idx = xoffset + x_loop * XBLOCK_SUB + tl.arange(0, XBLOCK_SUB)
         row_mask = row_idx < n_rows
 
-        # 沿 reduce axis 分块累加
+        # float32 累加器
         acc = tl.zeros([XBLOCK_SUB], dtype=tl.float32)
+
         for r_loop in range(r_loops):
             col_start = r_loop * RBLOCK
             rindex = col_start + rbase
@@ -101,11 +94,39 @@ def _reduce_sum_last_axis_kernel(
             ptrs = in_ptr + row_idx[:, None] * stride_in_row + rindex[None, :]
             block_mask = row_mask[:, None] & rmask[None, :]
             x = tl.load(ptrs, mask=block_mask, other=0.0)
-            acc = acc + tl.sum(x, axis=1)
+            acc = acc + tl.sum(x, axis=1).to(tl.float32)
 
-        # 写回每行的 sum 结果
         out_ptrs = out_ptr + row_idx * stride_out_row
         tl.store(out_ptrs, acc, mask=row_mask)
+
+
+# ============================================================================
+# Naive kernel (每行一个 program)
+# ============================================================================
+
+@triton.jit
+def _reduce_sum_last_axis_naive_kernel(
+    in_ptr, out_ptr,
+    n_rows, n_cols,
+    stride_in_row, stride_out_row,
+    RBLOCK: tl.constexpr,
+):
+    """Naive: 每个 program 处理一行，r_loops 分块累加"""
+    pid = tl.program_id(0)
+    row_idx = pid
+    rbase = tl.arange(0, RBLOCK)
+    r_loops: tl.constexpr = (n_cols + RBLOCK - 1) // RBLOCK
+
+    acc = tl.zeros([], dtype=tl.float32)
+    for r_loop in range(r_loops):
+        col_start = r_loop * RBLOCK
+        rindex = col_start + rbase
+        rmask = rindex < n_cols
+        ptrs = in_ptr + row_idx * stride_in_row + rindex
+        x = tl.load(ptrs, mask=rmask, other=0.0)
+        acc = acc + tl.sum(x).to(tl.float32)
+
+    tl.store(out_ptr + row_idx * stride_out_row, acc)
 
 
 # ============================================================================
@@ -119,8 +140,8 @@ def _get_num_vector_cores() -> int:
 
 
 def _safe_rblock(n_cols: int, xblock_sub: int, element_bytes: int = 4) -> int:
-    """计算安全的 RBLOCK 大小，确保不超出 UB"""
-    max_elements = _UB_MAX_ELEMENTS // max(xblock_sub, 1)
+    """计算安全的 RBLOCK，确保 XBLOCK_SUB * RBLOCK 不超出 UB"""
+    max_elements = _UB_MAX_INPUT_ELEMENTS // max(xblock_sub, 1)
     rblock = triton.next_power_of_2(min(n_cols, max_elements))
     return max(rblock, 1)
 
@@ -146,13 +167,12 @@ def reduce_sum(
     if axis == -1 or axis == x.ndim - 1:
         return _reduce_sum_last_axis(x, mode=mode)
     raise NotImplementedError(
-        f"reduce_sum only supports axis=-1 (last axis) and axis=None (full reduction). "
-        f"Got axis={axis}"
+        f"reduce_sum only supports axis=-1 and axis=None. Got axis={axis}"
     )
 
 
 def _reduce_sum_all(x: torch.Tensor) -> torch.Tensor:
-    """全量 sum: 多核部分和 + host 端最终 reduce"""
+    """全量 sum: 多核部分和 + host 端汇总"""
     n_elements = x.numel()
     x_flat = x.reshape(-1).contiguous()
 
@@ -163,15 +183,11 @@ def _reduce_sum_all(x: torch.Tensor) -> torch.Tensor:
     xblock_sub = min(xblock, 1024)
 
     partial = torch.zeros(num_cores, device=x.device, dtype=x.dtype)
-
-    grid = (num_cores, 1, 1)
-    _reduce_sum_1d_kernel[grid](
+    _reduce_sum_1d_kernel[(num_cores, 1, 1)](
         x_flat, partial,
         n_elements,
         XBLOCK=xblock, XBLOCK_SUB=xblock_sub,
     )
-
-    # 最终 reduce: 对 num_cores 个部分和求总和
     return partial.sum()
 
 
@@ -184,52 +200,32 @@ def _reduce_sum_last_axis(x: torch.Tensor, mode: str = "optimized") -> torch.Ten
     n_rows = x.numel() // n_cols
     x_2d = x.reshape(n_rows, n_cols)
 
-    # 输出: 去掉 last axis 的形状
     out_shape = original_shape[:-1]
     output = torch.empty(n_rows, device=x.device, dtype=x.dtype)
+    element_bytes = x.element_size()
+    num_cores = _get_num_vector_cores()
 
     if mode == "naive":
-        _reduce_sum_last_axis_naive(x_2d, output, n_rows, n_cols)
-    else:
-        _reduce_sum_last_axis_optimized(x_2d, output, n_rows, n_cols)
+        rblock = _safe_rblock(n_cols, 1, element_bytes)
+        _reduce_sum_last_axis_naive_kernel[(n_rows,)](
+            x_2d, output,
+            n_rows, n_cols,
+            x_2d.stride(0), output.stride(0),
+            RBLOCK=rblock,
+        )
+
+    elif mode == "optimized":
+        xblock = triton.cdiv(n_rows, num_cores)
+        xblock_sub = min(xblock, 8)
+        rblock = _safe_rblock(n_cols, xblock_sub, element_bytes)
+        _reduce_sum_last_axis_opt_kernel[(num_cores, 1, 1)](
+            x_2d, output,
+            n_rows, n_cols,
+            x_2d.stride(0), output.stride(0),
+            XBLOCK=xblock, XBLOCK_SUB=xblock_sub, RBLOCK=rblock,
+        )
 
     return output.reshape(out_shape)
-
-
-def _reduce_sum_last_axis_naive(
-    x_2d: torch.Tensor, output: torch.Tensor,
-    n_rows: int, n_cols: int,
-):
-    """Naive: 每个 program 处理一行"""
-    element_bytes = x_2d.element_size()
-    rblock = _safe_rblock(n_cols, xblock_sub=1, element_bytes=element_bytes)
-    grid = (n_rows,)
-    _reduce_sum_last_axis_kernel[grid](
-        x_2d, output,
-        n_rows, n_cols,
-        x_2d.stride(0), output.stride(0),
-        XBLOCK=1, XBLOCK_SUB=1, RBLOCK=rblock,
-    )
-
-
-def _reduce_sum_last_axis_optimized(
-    x_2d: torch.Tensor, output: torch.Tensor,
-    n_rows: int, n_cols: int,
-):
-    """Optimized: XBLOCK/XBLOCK_SUB/RBLOCK 三层切分"""
-    element_bytes = x_2d.element_size()
-    num_cores = _get_num_vector_cores()
-    xblock = triton.cdiv(n_rows, num_cores)
-    xblock_sub = min(xblock, 8)
-    rblock = _safe_rblock(n_cols, xblock_sub, element_bytes)
-
-    grid = (num_cores, 1, 1)
-    _reduce_sum_last_axis_kernel[grid](
-        x_2d, output,
-        n_rows, n_cols,
-        x_2d.stride(0), output.stride(0),
-        XBLOCK=xblock, XBLOCK_SUB=xblock_sub, RBLOCK=rblock,
-    )
 
 
 def ref_program(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
@@ -241,38 +237,21 @@ def main():
     num_cores = _get_num_vector_cores()
     print(f"Vector Cores: {num_cores}")
 
-    # 1D 全量 sum
-    x = torch.randn(1024, device="npu", dtype=torch.float32)
-    result = reduce_sum(x, axis=None)
-    ref = ref_program(x, axis=None)
-    torch.testing.assert_close(result.cpu(), ref.cpu(), rtol=1e-4, atol=1e-4)
-    print(f"1D full sum: PASS (result={result.item():.4f}, ref={ref.item():.4f})")
+    tests = [
+        ("1D full",       (1024,),      None),
+        ("2D small",      (128, 512),   -1),
+        ("2D large cols", (256, 8192),  -1),
+        ("3D",            (8, 128, 64), -1),
+    ]
 
-    # 2D last axis sum (naive)
-    x = torch.randn(128, 512, device="npu", dtype=torch.float32)
-    result = reduce_sum(x, axis=-1, mode="naive")
-    ref = ref_program(x, axis=-1)
-    torch.testing.assert_close(result.cpu(), ref.cpu(), rtol=1e-4, atol=1e-4)
-    print(f"2D last axis sum (naive): PASS, shape={result.shape}")
-
-    # 2D last axis sum (optimized)
-    result = reduce_sum(x, axis=-1, mode="optimized")
-    torch.testing.assert_close(result.cpu(), ref.cpu(), rtol=1e-4, atol=1e-4)
-    print(f"2D last axis sum (optimized): PASS, shape={result.shape}")
-
-    # 3D
-    x = torch.randn(8, 128, 64, device="npu", dtype=torch.float32)
-    result = reduce_sum(x, axis=-1, mode="optimized")
-    ref = ref_program(x, axis=-1)
-    torch.testing.assert_close(result.cpu(), ref.cpu(), rtol=1e-3, atol=1e-3)
-    print(f"3D last axis sum (optimized): PASS, shape={result.shape}")
-
-    # 大 reduce axis
-    x = torch.randn(256, 8192, device="npu", dtype=torch.float32)
-    result = reduce_sum(x, axis=-1, mode="optimized")
-    ref = ref_program(x, axis=-1)
-    torch.testing.assert_close(result.cpu(), ref.cpu(), rtol=1e-3, atol=1e-3)
-    print(f"Large reduce axis (8192): PASS, shape={result.shape}")
+    for name, shape, axis in tests:
+        x = torch.randn(*shape, device="npu", dtype=torch.float32)
+        ref = ref_program(x, axis=axis)
+        for mode in ["naive", "optimized"]:
+            result = reduce_sum(x, axis=axis, mode=mode)
+            rtol = 1e-3 if "large" in name else 1e-4
+            torch.testing.assert_close(result.cpu(), ref.cpu(), rtol=rtol, atol=rtol)
+        print(f"  {name:<16} shape={str(shape):<18} ALL PASS")
 
     print("\nAll correctness checks passed!")
 

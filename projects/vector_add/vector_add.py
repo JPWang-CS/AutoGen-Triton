@@ -1,19 +1,10 @@
 """
 Triton-Ascend 向量加法 (Vector Add)
 
-四种实现模式:
+三种实现模式:
 1. naive:     GPU 风格，每个 program 一段连续元素，grid 数量远超物理核数
 2. persistent: 固定核数 + tl.range 跨步分配（循环非 constexpr）
 3. optimized: XBLOCK/XBLOCK_SUB 双层切分 + constexpr 循环（编译器可展开流水线）
-4. pipelined: optimized + 显式 multibuffer 控制 + 无 mask（最大带宽模式）
-
-流水线原理 (multibuffer):
-  编译器看到 constexpr 循环时，自动将 UB 分为多个缓冲区，
-  使"拷入 N+1"与"计算 N"与"拷出 N-1"并行执行:
-
-  MTE2:   [load₀] [load₁] [load₂] [load₃] ...
-  Vector:         [calc₀] [calc₁] [calc₂] ...
-  MTE2:                  [store₀] [store₁] [store₂] ...
 """
 
 import triton
@@ -89,70 +80,6 @@ def _vector_add_kernel_optimized(
 
 
 # ============================================================================
-# Pipelined kernel (显式 MTE2/MTE3 流水并行)
-# ============================================================================
-
-@triton.jit
-def _vector_add_kernel_pipelined(
-    a_ptr, b_ptr, c_ptr,
-    XBLOCK: tl.constexpr,
-    XBLOCK_SUB: tl.constexpr,
-):
-    """
-    显式三阶段流水线: Prologue → Steady State → Epilogue
-
-    NPU 硬件有三个独立的执行单元:
-      - MTE2: 全局内存 → UB (拷入)
-      - Vector: UB 上计算
-      - MTE3: UB → 全局内存 (拷出)
-
-    流水线目标: 让 MTE2 拷入 block N+1 与 MTE3 拷出 block N 同时执行。
-
-    结构:
-      Prologue:   MTE2 拷入 block 0
-      Steady:     Vector 计算 block i
-                  MTE2 拷入 block i+1  ← 与下面并行
-                  MTE3 拷出 block i    ← 与上面并行
-      Epilogue:   Vector 计算 block last, MTE3 拷出 block last
-
-    时序图:
-      MTE2:   [load₀] [load₁] [load₂] [load₃] ...
-      Vector:         [calc₀] [calc₁] [calc₂] ...
-      MTE3:                   [store₀][store₁][store₂]...
-                              ↑ calc₁ 和 store₀ 并行
-    """
-    pid = tl.program_id(0)
-    base_offset = pid * XBLOCK
-    base = tl.arange(0, XBLOCK_SUB)
-    loops: tl.constexpr = (XBLOCK + XBLOCK_SUB - 1) // XBLOCK_SUB
-
-    # ---- Prologue: 预取 block 0 (MTE2 拷入) ----
-    curr_offset = base_offset + 0 * XBLOCK_SUB + base
-    a_buf = tl.load(a_ptr + curr_offset)
-    b_buf = tl.load(b_ptr + curr_offset)
-
-    # ---- Steady state: 计算 block i + 拷入 block i+1 + 拷出 block i ----
-    for i in range(loops - 1):
-        # [Vector] 计算当前块
-        c_buf = a_buf + b_buf
-
-        # [MTE2] 预取下一块 — 拷入 block i+1 (与下面的 store 并行)
-        next_offset = base_offset + (i + 1) * XBLOCK_SUB + base
-        a_buf = tl.load(a_ptr + next_offset)
-        b_buf = tl.load(b_ptr + next_offset)
-
-        # [MTE3] 写回当前块 — 拷出 block i (与上面的 load 并行)
-        tl.store(c_ptr + curr_offset, c_buf)
-
-        # 移动窗口
-        curr_offset = next_offset
-
-    # ---- Epilogue: 处理最后一块 ----
-    c_buf = a_buf + b_buf
-    tl.store(c_ptr + curr_offset, c_buf)
-
-
-# ============================================================================
 # Host 函数
 # ============================================================================
 
@@ -160,12 +87,6 @@ def _get_num_vector_cores() -> int:
     device = torch.npu.current_device()
     props = driver.active.utils.get_device_properties(device)
     return props["num_vectorcore"]
-
-
-def _align_size(n: int, num_cores: int, xblock_sub: int) -> int:
-    """将 size 向上对齐到 num_cores * xblock_sub 的倍数"""
-    alignment = num_cores * xblock_sub
-    return ((n + alignment - 1) // alignment) * alignment
 
 
 def vector_add(
@@ -180,7 +101,7 @@ def vector_add(
     参数:
         a: 输入向量 A
         b: 输入向量 B
-        mode: "naive" | "persistent" | "optimized" | "pipelined"
+        mode: "naive" | "persistent" | "optimized"
         xblock_sub: 核内子块大小
 
     返回:
@@ -220,28 +141,6 @@ def vector_add(
         )
         return c
 
-    elif mode == "pipelined":
-        num_cores = _get_num_vector_cores()
-        n_padded = _align_size(n_elements, num_cores, xblock_sub)
-        xblock = n_padded // num_cores
-
-        # Pad input to aligned size (extra bytes are uninitialized but won't be used)
-        if n_padded > n_elements:
-            a_pad = torch.empty(n_padded, device=a.device, dtype=a.dtype)
-            a_pad[:n_elements] = a
-            b_pad = torch.empty(n_padded, device=b.device, dtype=b.dtype)
-            b_pad[:n_elements] = b
-            c_pad = torch.empty(n_padded, device=a.device, dtype=a.dtype)
-        else:
-            a_pad, b_pad, c_pad = a, b, torch.empty_like(a)
-
-        grid = (num_cores, 1, 1)
-        _vector_add_kernel_pipelined[grid](
-            a_pad, b_pad, c_pad,
-            XBLOCK=xblock, XBLOCK_SUB=xblock_sub,
-        )
-        return c_pad[:n_elements].reshape(a.shape)
-
     else:
         raise ValueError(f"Unknown mode: {mode}")
 
@@ -261,7 +160,7 @@ def main():
         b = torch.randn(size, device="npu", dtype=torch.float32)
         ref_c = ref_program(a, b)
 
-        for mode in ["naive", "persistent", "optimized", "pipelined"]:
+        for mode in ["naive", "persistent", "optimized"]:
             c = vector_add(a, b, mode=mode)
             torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
             print(f"  size={size:>8}, mode={mode:>12}: PASS")

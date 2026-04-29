@@ -151,12 +151,12 @@ def run_sweep_benchmark(dtype: torch.dtype = torch.float32, warmup: int = 10, re
     element_bytes = torch.tensor([], dtype=dtype).element_size()
     dtype_name = {torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16"}.get(dtype, str(dtype))
 
-    print("\n" + "=" * 110)
-    print(f"  LayerNorm Sweep Benchmark  |  dtype={dtype_name}")
-    print("=" * 110)
-    print(f"  {'Shape':>16} | {'Triton(ms)':>10} {'Torch(ms)':>10} | "
-          f"{'Triton(GB/s)':>12} {'Torch(GB/s)':>12} | {'Speedup':>8} | {'MaxDiff':>10} | {'Pass':>5}")
-    print(f"  {'-'*106}")
+    print("\n" + "=" * 90)
+    print(f"  LayerNorm Sweep  |  dtype={dtype_name}")
+    print("=" * 90)
+    print(f"  {'Shape':>14} | {'Triton':>8} {'Torch':>8} | "
+          f"{'BW(GB/s)':>9} | {'Speedup':>7} | {'Diff':>10} | {'Pass':>4}")
+    print(f"  {'-'*86}")
 
     results = []
     for num_rows, num_cols in shapes:
@@ -175,19 +175,17 @@ def run_sweep_benchmark(dtype: torch.dtype = torch.float32, warmup: int = 10, re
         total_elements = num_rows * num_cols
         bytes_moved = (total_elements + num_cols + num_cols + total_elements) * element_bytes
         bw_triton = bytes_moved / (ms_triton * 1e-6) * 1e-9
-        bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
         speedup = ms_torch / ms_triton
-        pass_str = "PASS" if precision_pass else "FAIL"
+        pass_str = "OK" if precision_pass else "FAIL"
 
-        print(f"  ({num_rows:>4}, {num_cols:>4})   | {ms_triton:>10.4f} {ms_torch:>10.4f} | "
-              f"{bw_triton:>12.2f} {bw_torch:>12.2f} | {speedup:>7.3f}x | {max_diff:>10.2e} | {pass_str:>5}")
-        results.append({"shape": (num_rows, num_cols), "speedup": speedup, "max_diff": max_diff, "pass": precision_pass})
+        print(f"  ({num_rows:>4}, {num_cols:>4})   | {ms_triton:>7.3f}  {ms_torch:>7.3f} | "
+              f"{bw_triton:>8.1f}  | {speedup:>6.3f}x | {max_diff:>10.2e} | {pass_str:>4}")
+        results.append({"speedup": speedup, "pass": precision_pass})
 
-    print("=" * 110)
+    print("=" * 90)
     all_pass = all(r["pass"] for r in results)
     avg_speedup = sum(r["speedup"] for r in results) / len(results)
-    print(f"\n  精度检查 (rtol=1e-3, atol=1e-3): {'ALL PASS' if all_pass else 'HAS FAIL'}")
-    print(f"  平均加速比: {avg_speedup:.3f}x")
+    print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}  |  平均加速比: {avg_speedup:.3f}x")
     return results
 
 

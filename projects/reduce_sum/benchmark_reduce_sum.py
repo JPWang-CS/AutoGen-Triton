@@ -5,12 +5,6 @@ Triton-Ascend Reduce Sum 性能基准测试
   - Naive:     每行一个 program
   - Optimized: XBLOCK/XBLOCK_SUB/RBLOCK 三层切分 + constexpr 循环
   - PyTorch:   torch.sum()
-
-性能指标:
-  - 执行时间 (ms)
-  - 带宽 (GB/s)
-  - 加速比
-  - 数值精度 (rtol=1e-3, atol=1e-3)
 """
 
 import argparse
@@ -37,8 +31,8 @@ def ref_program(x: torch.Tensor, axis: int = -1) -> torch.Tensor:
         x_log=False,
         line_arg="provider",
         line_vals=["naive", "optimized", "torch"],
-        line_names=["Triton-Naive", "Triton-Optimized", "PyTorch"],
-        styles=[("red", "-"), ("blue", "-"), ("green", "-")],
+        line_names=["Naive", "Optimized", "PyTorch"],
+        styles=[("red", "-"), ("orange", "-"), ("green", "-")],
         ylabel="GB/s",
         plot_name="reduce-sum-performance",
         args={"num_rows": 4096},
@@ -61,13 +55,12 @@ def benchmark(num_rows, num_cols, provider):
             lambda: reduce_sum(x, axis=-1, mode="optimized"), quantiles=quantiles
         )
 
-    # 带宽: 读 input (rows*cols) + 写 output (rows) = (rows*cols + rows) * dtype_size
     gbps = lambda ms: (num_rows * num_cols + num_rows) * 4 / (ms * 1e-6) * 1e-9
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
 # ============================================================================
-# 详细对比 benchmark
+# 详细对比
 # ============================================================================
 
 def run_comparison_benchmark(
@@ -92,39 +85,43 @@ def run_comparison_benchmark(
 
     # 性能
     quantiles = [0.5, 0.2, 0.8]
-    ms_naive, _, _ = triton.testing.do_bench(
-        lambda: reduce_sum(x, axis=-1, mode="naive"), quantiles=quantiles, warmup=warmup, rep=rep
-    )
-    ms_optimized, _, _ = triton.testing.do_bench(
-        lambda: reduce_sum(x, axis=-1, mode="optimized"), quantiles=quantiles, warmup=warmup, rep=rep
-    )
+    results = {}
+    for mode in ["naive", "optimized"]:
+        ms, _, _ = triton.testing.do_bench(
+            lambda m=mode: reduce_sum(x, axis=-1, mode=m), quantiles=quantiles, warmup=warmup, rep=rep
+        )
+        results[mode] = ms
+
     ms_torch, _, _ = triton.testing.do_bench(
         lambda: ref_program(x), quantiles=quantiles, warmup=warmup, rep=rep
     )
 
     bytes_moved = (num_rows * num_cols + num_rows) * element_bytes
-    bw_naive = bytes_moved / (ms_naive * 1e-6) * 1e-9
-    bw_optimized = bytes_moved / (ms_optimized * 1e-6) * 1e-9
-    bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
 
-    sp_opt = ms_torch / ms_optimized
-
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 75)
     print(f"  Reduce Sum Benchmark  |  ({num_rows}, {num_cols})  |  dtype={dtype_name}")
-    print(f"  数据量: {num_rows * num_cols * element_bytes / 1024 / 1024:.2f} MB")
-    print("=" * 80)
-    print(f"\n  {'指标':<16} {'Naive':>10} {'Optimized':>12} {'PyTorch':>10} {'单位':>6}")
-    print(f"  {'-'*54}")
-    print(f"  {'延迟(ms)':<16} {ms_naive:>10.4f} {ms_optimized:>12.4f} {ms_torch:>10.4f} {'ms':>6}")
-    print(f"  {'带宽(GB/s)':<16} {bw_naive:>10.1f} {bw_optimized:>12.1f} {bw_torch:>10.1f} {'GB/s':>6}")
-    print(f"\n  加速比 Optimized vs PyTorch: {sp_opt:.3f}x")
-    print(f"  提升 Optimized vs Naive:     {ms_naive/ms_optimized:.2f}x")
-    print(f"\n  最大绝对误差: {max_diff:.2e}  |  精度 (rtol=1e-3): {'PASS' if precision_pass else 'FAIL'}")
-    print("=" * 80)
+    print("=" * 75)
+
+    print(f"\n  {'模式':<14} {'延迟(ms)':>10} {'带宽(GB/s)':>12} {'vs PyTorch':>12}")
+    print(f"  {'-'*48}")
+
+    for mode in ["naive", "optimized"]:
+        ms = results[mode]
+        bw = bytes_moved / (ms * 1e-6) * 1e-9
+        sp = ms_torch / ms
+        print(f"  {mode.upper():<14} {ms:>10.4f} {bw:>12.1f} {sp:>11.3f}x")
+
+    bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
+    print(f"  {'PYTORCH':<14} {ms_torch:>10.4f} {bw_torch:>12.1f} {'1.000x':>12}")
+
+    opt_speedup = results["naive"] / results["optimized"]
+    print(f"\n  Optimized vs Naive: {opt_speedup:.2f}x")
+    print(f"  精度 (rtol=1e-3): {'PASS' if precision_pass else 'FAIL'}, max_diff={max_diff:.2e}")
+    print("=" * 75)
 
 
 # ============================================================================
-# Sweep benchmark
+# Sweep
 # ============================================================================
 
 def run_sweep_benchmark(
@@ -137,12 +134,12 @@ def run_sweep_benchmark(
         torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
     }.get(dtype, str(dtype))
 
-    print("\n" + "=" * 110)
-    print(f"  Reduce Sum Sweep Benchmark  |  dtype={dtype_name}")
-    print("=" * 110)
-    print(f"  {'Shape':>14} | {'Naive(ms)':>10} {'Optim(ms)':>10} {'Torch(ms)':>10} | "
-          f"{'Opt(GB/s)':>10} {'Torch(GB/s)':>11} | {'SP-Opt':>7} | {'Diff':>10} | {'Pass':>5}")
-    print(f"  {'-'*106}")
+    print("\n" + "=" * 90)
+    print(f"  Reduce Sum Sweep  |  dtype={dtype_name}")
+    print("=" * 90)
+    print(f"  {'Shape':>14} | {'Naive':>8} {'Optim':>8} {'Torch':>8} | "
+          f"{'Optim BW':>9} | {'Speedup':>7} | {'Diff':>10} | {'Pass':>4}")
+    print(f"  {'-'*86}")
 
     results = []
     for rows, cols in shapes:
@@ -164,19 +161,17 @@ def run_sweep_benchmark(
 
         bytes_moved = (rows * cols + rows) * element_bytes
         bw_opt = bytes_moved / (ms_opt * 1e-6) * 1e-9
-        bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
-        sp_opt = ms_torch / ms_opt
-        pass_str = "PASS" if precision_pass else "FAIL"
+        speedup = ms_torch / ms_opt
+        pass_str = "OK" if precision_pass else "FAIL"
 
-        print(f"  ({rows:>4}, {cols:>4})   | {ms_naive:>10.4f} {ms_opt:>10.4f} {ms_torch:>10.4f} | "
-              f"{bw_opt:>10.1f} {bw_torch:>11.1f} | {sp_opt:>6.3f}x | {max_diff:>10.2e} | {pass_str:>5}")
-        results.append({"shape": (rows, cols), "sp_opt": sp_opt, "max_diff": max_diff, "pass": precision_pass})
+        print(f"  ({rows:>4}, {cols:>4})   | {ms_naive:>7.3f}  {ms_opt:>7.3f}  {ms_torch:>7.3f} | "
+              f"{bw_opt:>8.1f}  | {speedup:>6.3f}x | {max_diff:>10.2e} | {pass_str:>4}")
+        results.append({"speedup": speedup, "pass": precision_pass})
 
-    print("=" * 110)
+    print("=" * 90)
     all_pass = all(r["pass"] for r in results)
-    avg_sp = sum(r["sp_opt"] for r in results) / len(results)
-    print(f"\n  精度 (rtol=1e-3): {'ALL PASS' if all_pass else 'HAS FAIL'}")
-    print(f"  Optimized 平均加速比 vs PyTorch: {avg_sp:.3f}x")
+    avg_sp = sum(r["speedup"] for r in results) / len(results)
+    print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}  |  Optimized 平均加速 vs PyTorch: {avg_sp:.3f}x")
 
 
 def main():
