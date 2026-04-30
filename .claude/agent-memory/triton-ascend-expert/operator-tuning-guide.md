@@ -124,11 +124,12 @@ Step 6: 验证
 3. **尾轴对齐**: 32B (VV) / 512B (CV)
 4. **multibuffer**: UB 充裕时开启（默认已开）
 5. **避免标量退化**: 整数比较前 `.to(tl.float32)`
-6. **UB 容量**: 检查所有中间张量总量 ≤ UB - 余量
+6. **UB 容量**: 使用 48KB 实用上限（不是 96KB doublebuffer slot）
 7. **连续访存**: 优先 `ptr + offsets` 模式
 8. **mask 保护**: 所有 load/store 必须有 mask
-9. **autotune**: 关键参数用 autotune 搜索最优组合
+9. **autotune**: 搜索 BLOCK_SIZE + multibuffer 组合
 10. **精度**: 累加器使用 float32，最终转换回目标 dtype
+11. **先分类**: 判断算子是 memory/compute/UB bound，针对性优化
 
 ## 7. Benchmark 方法论
 
@@ -138,7 +139,9 @@ Step 6: 验证
 
 ```python
 import os
-os.environ["TRITON_BENCH_METHOD"] = "npu"  # NPU 精确计时必需
+# 必须在 import torch_npu 之前设置
+os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "3"  # 抑制 CANN profiler 日志
+os.environ["TRITON_BENCH_METHOD"] = "npu"    # NPU 精确计时
 
 # 标准用法
 triton.testing.do_bench(
@@ -146,6 +149,34 @@ triton.testing.do_bench(
     warmup=10,
     rep=100,
 )
+```
+
+**噪音抑制**: `TRITON_BENCH_METHOD="npu"` 会触发 CANN profiler，每次 do_bench 打印 3-4 行日志。用 `_silent_bench` 包裹:
+
+```python
+import sys
+from io import StringIO
+
+def _silent_bench(fn, quantiles=None, warmup=10, rep=100):
+    """静默执行 do_bench，抑制所有中间输出。"""
+    if quantiles is None:
+        quantiles = [0.5, 0.2, 0.8]
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = StringIO()
+    sys.stderr = StringIO()
+    try:
+        result = triton.testing.do_bench(fn, quantiles=quantiles, warmup=warmup, rep=rep)
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+    return result
+```
+
+**带宽计算**: `do_bench` 返回毫秒，转秒用 `×1e-3`（不是 `×1e-6`）:
+
+```python
+def calc_bandwidth_gbs(n_elements, element_bytes, ms):
+    return 3 * n_elements * element_bytes / (ms * 1e-3) * 1e-9
 ```
 
 **关键**: NPU 上必须设 `TRITON_BENCH_METHOD="npu"` 才能获得准确计时。
@@ -177,6 +208,27 @@ import triton.backends.ascend.runtime
 **Auto-profiling**:
 ```python
 triton.autotune(..., auto_profile_dir="./autotune_profile")
+```
+
+**Autotune BLOCK_SIZE 搜索范围** (实测验证):
+
+| 算子类型 | BLOCK_SIZE 范围 | multibuffer | Config 数量 |
+|---------|----------------|-------------|-----------|
+| element-wise (add, relu) | 512 ~ 4096 | True + False | 6~8 |
+| 归约 (sum, max) | 256 ~ 1024 | True | 3~4 |
+| GEMM | 64/128 (fractal 倍数) | True | 3~4 |
+| LayerNorm/Softmax | next_power_of_2(N) | True | 1 |
+
+推荐在 element-wise autotune 中同时搜索 multibuffer=True 和 False:
+```python
+configs=[
+    triton.Config({'BLOCK_SIZE': 1024}, multibuffer=True),
+    triton.Config({'BLOCK_SIZE': 2048}, multibuffer=True),
+    triton.Config({'BLOCK_SIZE': 4096}, multibuffer=True),
+    triton.Config({'BLOCK_SIZE': 2048}, multibuffer=False),  # UB 翻倍
+    triton.Config({'BLOCK_SIZE': 4096}, multibuffer=False),
+    triton.Config({'BLOCK_SIZE': 8192}, multibuffer=False),
+]
 ```
 
 ### FLOPs 计算

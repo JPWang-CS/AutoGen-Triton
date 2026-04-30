@@ -1,6 +1,6 @@
 ---
 name: triton-op-tuning
-description: Triton-Ascend 算子性能调优技能，涵盖 profiling 工具使用（msprof）、性能数据分析、瓶颈定位、Tiling 优化策略、编译器选项调优、UB 容量规划、标量退化避免等。基于 triton-ascend 官方文档 programming_guide、profiling_guide 和 architecture_difference。
+description: Triton-Ascend 算子性能调优技能，涵盖算子分类分析（memory/compute/UB bound）、profiling 工具、瓶颈定位、Tiling 优化、UB 实用上限（48KB）、autotune 配置范围、编译器选项调优。
 ---
 
 # Triton-Ascend 算子调优技能
@@ -19,6 +19,32 @@ description: Triton-Ascend 算子性能调优技能，涵盖 profiling 工具使
 - 用户需要使用 msprof 工具分析算子
 - 用户需要选择合适的 Tiling 参数
 - 用户需要配置编译器优化选项
+
+---
+
+## 零、算子分类与优化策略
+
+在调优前，先判断算子的瓶颈类型，不同类型适用不同优化手段:
+
+| 算子类型 | 特征 | 瓶颈 | 有效的优化手段 | 代表算子 |
+|---------|------|------|-------------|---------|
+| **内存 bound** | 2~3 I/O, 极少计算 | GM 带宽 | 物理核绑定、大 BLOCK | add, copy, assign |
+| **计算 bound** | 多步计算、归约 | Vector 计算 | 标量退化避免、constexpr 循环、multibuffer | softmax, layernorm, gelu |
+| **UB bound** | 大中间张量 | UB 容量 | XBLOCK/XBLOCK_SUB 二级切分、rblock 规划 | reduce_sum, reduce_max |
+| **CV 融合** | tl.dot + 后处理 | Cube/Vector 协调 | enable_auto_bind_sub_block、CV 负载均衡 | flash-attn, matmul+bias |
+
+### 内存 bound 算子的优化效果 (vector_add 实测)
+
+内存 bound 算子: kernel 结构优化（constexpr 循环、XBLOCK/XBLOCK_SUB）收益有限，效果主要来自物理核绑定减少调度开销。
+
+| 数据量 | Naive(GPU grid) | Optimized(物理核绑定) | 提升 |
+|-------|-----------------|---------------------|------|
+| ≤16K | 更快（调度开销可忽略） | 较慢 | - |
+| 256K | 4.074ms | 3.495ms | 1.17x |
+| 1M | 10.733ms | 5.014ms | **2.14x** |
+| 4M | 38.675ms | 11.035ms | **3.51x** |
+
+**结论**: 小数据量（<64K）用 Naive 即可，大数据量必须物理核绑定。Autotune 可达 PyTorch 95% 性能。
 
 ---
 
@@ -185,9 +211,23 @@ def _safe_rblock(n_cols, xblock_sub, num_tensors=1):
 
 Atlas A2 UB = 192 KB = 196,608 bytes = 49,152 个 float32 元素。
 
-**实用常量**: `_UB_MAX_INPUT_ELEMENTS = 12 * 1024 = 12,288`（约 48KB，留余量给其他中间变量）。
+**重要: 实用上限 48KB，不是 96KB（doublebuffer slot）或 192KB（总量）**
 
-**开启 multibuffer (doublebuffer) 后容量减半**: 可用约 24KB = 6,144 个 float32。
+编译器需要中间变量空间，填满 UB 会导致 overflow。实测验证的安全上限:
+```python
+_UB_PRACTICAL_LIMIT = 48 * 1024  # 48KB 实用上限
+# element-wise 3 I/O 张量: 48KB / 12B = 4096 元素 (不是 8192)
+```
+
+**开启 multibuffer (doublebuffer) 后容量再减半**: 可用约 24KB = 6,144 个 float32。
+
+**安全 block size 计算**:
+```python
+def _safe_block_size(element_bytes, num_tensors=3):
+    """使用 48KB 实用上限，而非理论 96KB"""
+    max_elements = _UB_PRACTICAL_LIMIT // (num_tensors * element_bytes)
+    return max(1 << (max_elements.bit_length() - 1), 64)
+```
 
 **UB 使用量估算**:
 ```python
@@ -197,6 +237,17 @@ ub_elements += xblock_sub * rblock  # 累加器 (pairwise)
 ub_elements += xblock_sub           # 输出标量
 # 确保 ub_elements * element_size <= UB_CAPACITY
 ```
+
+### Autotune BLOCK_SIZE 搜索范围
+
+根据算子类型选择搜索范围 (实测验证):
+
+| 算子类型 | BLOCK_SIZE 范围 | 说明 |
+|---------|----------------|------|
+| element-wise (add, relu) | 512 ~ 4096 | 受 UB 实用上限约束 |
+| 归约 (sum, max) | 256 ~ 1024 | rblock 受 UB 约束更紧 |
+| LayerNorm/Softmax | next_power_of_2(N) | 需覆盖完整行 |
+| GEMM | 64/128 (fractal 倍数) | FP16/BF16: 16 的倍数 |
 
 ---
 

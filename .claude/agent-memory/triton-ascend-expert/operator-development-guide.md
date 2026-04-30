@@ -132,8 +132,20 @@ rblock 份 → 每次处理 rblock 列
 
 ### Atlas A2 规格
 - 总 UB = 192 KB
-- 实用上限 = ~48 KB (余量给中间变量)
+- **实测验证的实用上限 = 48 KB** (填满 96KB doublebuffer slot 会触发 overflow)
 - `_UB_MAX_INPUT_ELEMENTS = 12 * 1024 = 12,288` (float32)
+
+### 安全 block size 计算（实测验证）
+
+```python
+_UB_PRACTICAL_LIMIT = 48 * 1024  # 48KB, 不是 96KB
+
+def _safe_block_size(element_bytes, num_tensors=3):
+    """使用 48KB 实用上限计算 block size"""
+    max_elements = _UB_PRACTICAL_LIMIT // (num_tensors * element_bytes)
+    return max(1 << (max_elements.bit_length() - 1), 64)
+# fp32 + 3 I/O: 48KB / 12B = 4096 元素 (不是 8192!)
+```
 
 ### UB 安全 RBLOCK 计算
 ```python
@@ -372,3 +384,37 @@ device = torch.npu.current_device()  # 注意: 不是 torch.cuda
 
 ### 离散访存优化
 优先连续访存 (`ptr + offsets`)。离散访问时先加载整块到 UB，再用 `tl.gather` 选取，避免逐元素标量访问。
+
+## 11. 算子瓶颈分类与优化策略 (实测验证)
+
+来源: vector_add 优化实战 (Atlas A2, 2026-04-30)
+
+| 算子类型 | 特征 | 瓶颈 | 有效的优化手段 | 代表算子 |
+|---------|------|------|-------------|---------|
+| **内存 bound** | 2~3 I/O, 极少计算 | GM 带宽 | 物理核绑定、大 BLOCK | add, copy |
+| **计算 bound** | 多步计算、归约 | Vector 计算 | 标量退化避免、constexpr 循环 | softmax, layernorm |
+| **UB bound** | 大中间张量 | UB 容量 | XBLOCK/XBLOCK_SUB 二级切分 | reduce_sum |
+| **CV 融合** | tl.dot + 后处理 | Cube/Vector 协调 | CV 负载均衡 | flash-attn |
+
+### 物理核绑定效果 (vector_add 实测)
+
+| 数据量 | Naive(GPU grid) | Optimized(物理核绑定) | 提升 |
+|-------|-----------------|---------------------|------|
+| ≤16K | Naive 更快 | 较慢 (核启动开销占主) | <1x |
+| 256K | 4.074ms | 3.495ms | 1.17x |
+| 1M | 10.733ms | 5.014ms | **2.14x** |
+| 4M | 38.675ms | 11.035ms | **3.51x** |
+
+**结论**:
+- 小数据 (<64K): Naive 即可，物理核绑定反而增加开销
+- 大数据 (≥256K): 物理核绑定是关键优化，可提升 1.2x~3.5x
+- 内存 bound 算子: constexpr 循环、XBLOCK/XBLOCK_SUB 等结构优化收益有限
+- Autotune 可达 PyTorch 95% 性能
+
+### Autotune BLOCK_SIZE 搜索范围 (实测)
+
+| 算子类型 | BLOCK_SIZE 范围 | multibuffer |
+|---------|----------------|-------------|
+| element-wise | 512 ~ 4096 | True/False 都搜 |
+| 归约 | 256 ~ 1024 | True |
+| GEMM | 64/128 (fractal 倍数) | True |

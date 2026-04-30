@@ -98,6 +98,7 @@ All 10 SKILL.md files generated based on:
 - `operator-tuning-guide.md` — msprof profiling、benchmark 方法论、瓶颈定位、标量退化避免、编译器选项、SOC 版本、优化工作流
 - `operator-testing-guide.md` — 测试模式、dtype 精度容差、Fractal 对齐测试、边界用例设计、GEMM 测试约束
 - `triton-api-reference.md` — 全量 API 参考（~90个 API，18 分类），含签名、dtype 支持、Ascend 约束、文档 URL 路径
+- `vector-add-optimization-case.md` — vector_add 优化实战: 物理核绑定 3.5x 提升、内存 bound 分析、UB 48KB 实用上限验证、噪音抑制技巧
 
 ### Key Knowledge Learned
 1. **NPU 分核原则**: grid 必须固定为物理核数（vectorcore_num / aicore_num），核内循环处理

@@ -136,13 +136,13 @@ def tiled_gemm(a, b):
 ```python
 def get_gemm_configs():
     return [
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32}),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}),
-        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}),
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32}),
-        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 256, "BLOCK_K": 64}, multibuffer=True),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 32}, multibuffer=True),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 32}, multibuffer=True),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "BLOCK_K": 32}, multibuffer=True),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 128, "BLOCK_K": 32}, multibuffer=True),
+        triton.Config({"BLOCK_M": 64, "BLOCK_N": 32, "BLOCK_K": 32}, multibuffer=True),
+        triton.Config({"BLOCK_M": 32, "BLOCK_N": 64, "BLOCK_K": 32}, multibuffer=True),
     ]
 
 @triton.autotune(configs=get_gemm_configs(), key=["M", "N", "K"])
@@ -231,6 +231,26 @@ persistent_gemm_kernel[grid](a, b, c, M, N, K,
 ---
 
 ## 7.6 性能分析
+
+### Fractal 对齐要求
+
+NPU Cube Core 执行矩阵乘法时，数据按"分形"（fractal）格式排列：
+
+| 数据类型 | 分形大小 | BLOCK 约束 |
+|---------|---------|-----------|
+| FP16 | 16×16 | BLOCK_M/N/K 必须是 16 的倍数 |
+| BF16 | 16×16 | 同 FP16 |
+| INT8 | 32×16 或 16×32 | BLOCK 必须是 16 或 32 的倍数 |
+
+**推荐**: BLOCK_M、BLOCK_N、BLOCK_K 均选择 16 的倍数（如 32, 64, 128, 256）。
+
+### tf.dot 数据类型约束
+
+| 特性 | 说明 |
+|------|------|
+| 支持输入 | int8, int16, int32, fp16, fp32, bf16 |
+| 不支持输入 | uint8/16/32/64, fp64 |
+| 累加器 | 必须 fp32（不支持 fp16 累加） |
 
 ### TFLOPS 计算
 

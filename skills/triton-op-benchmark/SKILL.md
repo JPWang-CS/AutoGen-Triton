@@ -1,6 +1,6 @@
 ---
 name: triton-op-benchmark
-description: 为Triton-Ascend算子生成性能基准测试文件。用户提出"生成benchmark/性能测试/性能对比"时使用本技能。
+description: 为Triton-Ascend算子生成性能基准测试文件。包含噪音抑制、静默采集模式、带宽计算修正。用户提出"生成benchmark/性能测试/性能对比"时使用本技能。
 ---
 
 # Triton-Ascend 算子性能基准测试生成
@@ -17,6 +17,65 @@ description: 为Triton-Ascend算子生成性能基准测试文件。用户提出
    - 与 PyTorch / torch_npu 参考实现的性能对比
    - 不同配置的性能测试（BLOCK_SIZE、multibuffer 等）
    - 结果输出和数据汇总
+
+## 噪音抑制与静默采集 (重要)
+
+`TRITON_BENCH_METHOD="npu"` 会触发 CANN profiler，每次 `do_bench` 打印 3-4 行日志。在 sweep 场景下产生大量噪音，淹没结果表格。
+
+### 必须设置的环境变量
+
+```python
+import os
+# 必须在 import torch_npu 之前设置
+os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "3"  # 0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR
+os.environ["TRITON_BENCH_METHOD"] = "npu"
+```
+
+### 静默采集模式: 先执行后打印
+
+所有 `do_bench` 调用用 `_silent_bench` 包裹，结果暂存变量，最后统一打印:
+
+```python
+import sys
+from io import StringIO
+
+def _silent_bench(fn, quantiles=None, warmup=10, rep=100):
+    """静默执行 do_bench，抑制 CANN profiler 日志。"""
+    if quantiles is None:
+        quantiles = [0.5, 0.2, 0.8]
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout = StringIO()
+    sys.stderr = StringIO()
+    try:
+        result = triton.testing.do_bench(fn, quantiles=quantiles, warmup=warmup, rep=rep)
+    finally:
+        sys.stdout = old_out
+        sys.stderr = old_err
+    return result
+
+# 使用: 先采集所有数据
+rows = []
+for size in sizes:
+    # ... 准备数据 ...
+    for mode in modes:
+        ms, _, _ = _silent_bench(lambda: my_kernel(...))
+        ms_map[mode] = ms
+    rows.append(...)
+
+# 最后统一打印
+for row in rows:
+    print(f"  {row['size']:>8} | {row['naive']:>7.3f}  ...")
+```
+
+### 带宽计算
+
+```python
+def calc_bandwidth_gbs(n_elements, element_bytes, ms):
+    """正确: do_bench 返回 ms, 转 秒用 ×1e-3"""
+    return 3 * n_elements * element_bytes / (ms * 1e-3) * 1e-9
+
+# 常见错误: ms * 1e-6 (偏高 1000 倍!)
+```
 
 ## Benchmark 文件结构
 
