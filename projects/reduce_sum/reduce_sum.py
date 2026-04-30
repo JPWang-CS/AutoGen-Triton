@@ -5,13 +5,14 @@ Triton-Ascend Reduce Sum
   output = sum(input, axis=dim)
 
 支持两种累加策略 (precision 参数):
-1. "simple":   直接 acc += tl.sum(x, RBLOCK) — 最快，精度一般
-2. "pairwise": RBLOCK=8 逐元素累加到 [xsub, 8]，最后 tl.sum(8) — 精度好
+1. "simple":   acc += tl.sum(x, axis=1) — 每轮迭代做一次 tl.sum 归约
+2. "pairwise": 逐元素累加到 [xsub, RBLOCK]，最后一次 tl.sum(RBLOCK)
 
-  pairwise 原理 (a+b+c+d+e+f+g+h):
-    simple:   ((((a+b)+c)+d)+e)+f)+g)+h)     ← 大数吃小数
-    pairwise: (a+b)+(c+d)+(e+f)+(g+h)          ← 等量级相加
-              = col_0_sum + col_1_sum + ... + col_7_sum
+  精度对比 (a+b+c+d+e+f+g+h+i+j+k+l+m+n+o+p):
+    simple:   acc += sum(16) → 每个 group_sum 带归约误差，累积叠加
+    pairwise: [c0,c1,...,c15] 逐元素累加 → 各列等量级 → 最后 tl.sum(16)
+
+  关键: pairwise 的 RBLOCK 越大 → r_loops 越少 → 每列顺序累加次数越少 → 精度越好
 
 NPU 特殊处理:
 - 累加器始终使用 float32
@@ -24,7 +25,6 @@ import triton.runtime.driver as driver
 import torch
 
 _UB_MAX_INPUT_ELEMENTS = 12 * 1024
-_PAIRWISE_RBLOCK = 8
 
 
 # ============================================================================
@@ -64,7 +64,7 @@ def _reduce_sum_opt_simple_kernel(
 
 
 # ============================================================================
-# 2D Optimized kernel — pairwise (小块逐元素累加, 最后 tl.sum(8))
+# 2D Optimized kernel — pairwise (逐元素累加, 最后 tl.sum)
 # ============================================================================
 
 @triton.jit
@@ -77,8 +77,9 @@ def _reduce_sum_opt_pairwise_kernel(
     RBLOCK: tl.constexpr,
 ):
     """
-    Pairwise: RBLOCK=8, 逐元素累加到 [xsub, 8], 最后 tl.sum(8).
-    每 8 个元素为一组，各列独立累加 → 最后 8 个等量级列和相加 → 精度好.
+    Pairwise: 逐元素累加到 [xsub, RBLOCK], 最后 tl.sum(RBLOCK).
+    RBLOCK 尽量大 → r_loops 少 → 每列顺序累加少 → 精度好.
+    不像 simple 每轮做 tl.sum, 这里每轮只做 element-wise add, 最后才归约.
     """
     pid = tl.program_id(0)
     xoffset = pid * XBLOCK
@@ -158,7 +159,7 @@ def _reduce_sum_naive_pairwise_kernel(
 
 @triton.jit
 def _reduce_sum_1d_kernel(
-    in_ptr, out_ptr,
+    in_ptr, out_ptr, 
     n_elements,
     XBLOCK: tl.constexpr,
     XBLOCK_SUB: tl.constexpr,
@@ -187,7 +188,15 @@ def _get_num_vector_cores() -> int:
 
 
 def _safe_rblock(n_cols: int, xblock_sub: int, element_bytes: int = 4) -> int:
+    """simple 模式: 只有 [xsub, RBLOCK] 输入 + [xsub] 标量累加器"""
     max_elements = _UB_MAX_INPUT_ELEMENTS // max(xblock_sub, 1)
+    rblock = triton.next_power_of_2(min(n_cols, max_elements))
+    return max(rblock, 1)
+
+
+def _safe_rblock_pairwise(n_cols: int, xblock_sub: int, element_bytes: int = 4) -> int:
+    """pairwise 模式: 需要 [xsub, RBLOCK] 输入 + [xsub, RBLOCK] 2D 累加器, 占 2x UB"""
+    max_elements = (_UB_MAX_INPUT_ELEMENTS // 2) // max(xblock_sub, 1)
     rblock = triton.next_power_of_2(min(n_cols, max_elements))
     return max(rblock, 1)
 
@@ -206,9 +215,9 @@ def reduce_sum(
         axis: 归约轴 (支持 -1/last axis 和 None/全量)
         mode: "naive" | "optimized"
         precision: "simple" | "pairwise"
-          - simple:   acc += tl.sum(x, axis=1) 一次大块归约，最快
-          - pairwise: RBLOCK=8 逐元素累加 [xsub, 8]，最后 tl.sum(8)
-                      等量级相加: (a+b)+(c+d)+...
+          - simple:   acc += tl.sum(x, axis=1) 每轮做 tl.sum，最快
+          - pairwise: 逐元素累加 [xsub, RBLOCK]，最后一次 tl.sum(RBLOCK)
+                      RBLOCK 取 UB 允许最大值 → r_loops 最少 → 精度优于 simple
 
     返回:
         归约结果张量
@@ -255,7 +264,7 @@ def _reduce_sum_last_axis(
 
     if mode == "naive":
         if precision == "pairwise":
-            rblock = _PAIRWISE_RBLOCK
+            rblock = _safe_rblock_pairwise(n_cols, 1, element_bytes)
             _reduce_sum_naive_pairwise_kernel[(n_rows,)](
                 x_2d, output, n_rows, n_cols,
                 x_2d.stride(0), output.stride(0),
@@ -273,7 +282,7 @@ def _reduce_sum_last_axis(
         xblock_sub = min(xblock, 8)
 
         if precision == "pairwise":
-            rblock = _PAIRWISE_RBLOCK
+            rblock = _safe_rblock_pairwise(n_cols, xblock_sub, element_bytes)
             _reduce_sum_opt_pairwise_kernel[(num_cores, 1, 1)](
                 x_2d, output, n_rows, n_cols,
                 x_2d.stride(0), output.stride(0),
