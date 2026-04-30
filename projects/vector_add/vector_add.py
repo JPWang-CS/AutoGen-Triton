@@ -1,16 +1,15 @@
 """
 Triton-Ascend 向量加法 (Vector Add)
 
-四种实现模式:
-1. naive:     GPU 风格，每个 program 一段连续元素，grid 数量远超物理核数
-2. persistent: 固定核数 + tl.range 跨步分配（循环非 constexpr）
-3. optimized: XBLOCK/XBLOCK_SUB 双层切分 + constexpr 循环（编译器可展开流水线）
-4. autotune:  @triton.autotune 自动搜索最优 BLOCK_SIZE + multibuffer 组合
+两种实现模式:
+1. naive:     GPU 风格，每个 program 一段连续元素
+2. optimized: @triton.autotune 自动搜索最优 BLOCK_SIZE + multibuffer + constexpr 循环
 
-UB 优化:
-- 根据数据类型自动计算最优 block size，填满 UB
-- doublebuffer 后 96KB 可用，3 个 I/O 张量 → float32 最优 8192 元素
-- autotune 模式额外搜索 multibuffer=False（UB 翻倍，适合大 block）
+NPU 内存 bound 操作分析:
+  vector_add = 2 load + 1 store + 1 add，计算量极小
+  瓶颈是 GM 带宽，不是核心调度/UB 容量
+  kernel 结构优化对纯内存 bound 操作收益有限
+  需要通过 autotune 搜索最优 block size + multibuffer 组合
 """
 
 import triton
@@ -18,13 +17,12 @@ import triton.language as tl
 import triton.runtime.driver as driver
 import torch
 
-_UB_TOTAL_BYTES = 192 * 1024  # 192KB
-
+_UB_PRACTICAL_LIMIT = 48 * 1024  # 48KB 实用上限（留余量）
 _IO_TENSORS = 3  # a, b, c
 
 
 # ============================================================================
-# Naive kernel (GPU 风格)
+# Naive kernel (GPU 风格 baseline)
 # ============================================================================
 
 @triton.jit
@@ -42,31 +40,11 @@ def _vector_add_kernel_naive(
 
 
 # ============================================================================
-# Persistent kernel (固定核数 + tl.range，循环非 constexpr)
+# Optimized kernel — XBLOCK/XBLOCK_SUB constexpr 循环 (NPU 推荐模式)
 # ============================================================================
 
 @triton.jit
-def _vector_add_kernel_persistent(
-    a_ptr, b_ptr, c_ptr,
-    n_elements,
-    BLOCK_SIZE: tl.constexpr,
-    NUM_CORES: tl.constexpr,
-):
-    pid = tl.program_id(axis=0)
-    for block_id in tl.range(pid, tl.cdiv(n_elements, BLOCK_SIZE), NUM_CORES):
-        offsets = block_id * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
-        mask = offsets < n_elements
-        a = tl.load(a_ptr + offsets, mask=mask)
-        b = tl.load(b_ptr + offsets, mask=mask)
-        tl.store(c_ptr + offsets, a + b, mask=mask)
-
-
-# ============================================================================
-# Optimized kernel (XBLOCK/XBLOCK_SUB constexpr 循环)
-# ============================================================================
-
-@triton.jit
-def _vector_add_kernel_optimized(
+def _vector_add_kernel_blocking(
     a_ptr, b_ptr, c_ptr,
     n_elements,
     XBLOCK: tl.constexpr,
@@ -86,17 +64,22 @@ def _vector_add_kernel_optimized(
 
 
 # ============================================================================
-# Autotune kernel — @triton.autotune 自动搜索最优配置
+# Autotune kernel — 自动搜索最优 BLOCK_SIZE + multibuffer
+# skill 推荐 element-wise block 范围: 128 ~ 4096
+# 搜索 multibuffer True/False: True 流水重叠, False UB 翻倍可用更大 block
 # ============================================================================
 
 @triton.autotune(
     configs=[
+        # multibuffer=True: 流水重叠（UB 减半为 96KB slot）
+        triton.Config({'BLOCK_SIZE': 512},  multibuffer=True),
+        triton.Config({'BLOCK_SIZE': 1024}, multibuffer=True),
         triton.Config({'BLOCK_SIZE': 2048}, multibuffer=True),
         triton.Config({'BLOCK_SIZE': 4096}, multibuffer=True),
-        triton.Config({'BLOCK_SIZE': 8192}, multibuffer=True),
+        # multibuffer=False: UB 全量 192KB，适合更大 block
+        triton.Config({'BLOCK_SIZE': 2048}, multibuffer=False),
         triton.Config({'BLOCK_SIZE': 4096}, multibuffer=False),
         triton.Config({'BLOCK_SIZE': 8192}, multibuffer=False),
-        triton.Config({'BLOCK_SIZE': 16384}, multibuffer=False),
     ],
     key=['n_elements'],
 )
@@ -126,14 +109,13 @@ def _get_num_vector_cores() -> int:
     return props["num_vectorcore"]
 
 
-def _optimal_block_size(element_bytes: int) -> int:
-    """计算填满 UB 的最优 block size (2 的幂).
+def _safe_block_size(element_bytes: int) -> int:
+    """UB 安全的 block size (2 的幂).
 
-    doublebuffer 将 192KB 分为两个 96KB 槽位.
-    每个槽位存放 _IO_TENSORS 个张量 (a, b, c).
+    使用实用上限 48KB 而非理论 96KB，留余量给编译器中间变量。
+    3 个 I/O 张量 (a, b, c) 平分实用上限。
     """
-    effective_ub = _UB_TOTAL_BYTES // 2
-    max_elements = effective_ub // (_IO_TENSORS * element_bytes)
+    max_elements = _UB_PRACTICAL_LIMIT // (_IO_TENSORS * element_bytes)
     return max(1 << (max_elements.bit_length() - 1), 64)
 
 
@@ -144,23 +126,23 @@ def vector_add(
     xblock_sub: int = 0,
 ) -> torch.Tensor:
     """
-    向量加法主机函数: C = A + B
+    向量加法: C = A + B
 
     参数:
         a: 输入向量 A
         b: 输入向量 B
-        mode: "naive" | "persistent" | "optimized" | "autotune"
-        xblock_sub: 核内子块大小 (仅 optimized 模式)，0 表示自动计算
+        mode: "naive" | "optimized" | "autotune"
+        xblock_sub: 核内子块大小 (仅 optimized 模式)，0 表示 UB 安全自动计算
 
     返回:
-        输出向量 C，形状与输入相同
+        输出向量 C
     """
     assert a.shape == b.shape, "Input shapes must match"
     n_elements = a.numel()
     element_bytes = a.element_size()
 
     if xblock_sub <= 0:
-        xblock_sub = _optimal_block_size(element_bytes)
+        xblock_sub = _safe_block_size(element_bytes)
 
     if mode == "naive":
         c = torch.empty_like(a)
@@ -170,23 +152,13 @@ def vector_add(
         )
         return c
 
-    elif mode == "persistent":
-        num_cores = _get_num_vector_cores()
-        c = torch.empty_like(a)
-        grid = (num_cores,)
-        _vector_add_kernel_persistent[grid](
-            a, b, c, n_elements,
-            BLOCK_SIZE=xblock_sub, NUM_CORES=num_cores,
-        )
-        return c
-
     elif mode == "optimized":
         num_cores = _get_num_vector_cores()
         xblock = triton.cdiv(n_elements, num_cores)
         xblock = triton.cdiv(xblock, xblock_sub) * xblock_sub
         c = torch.empty_like(a)
         grid = (num_cores, 1, 1)
-        _vector_add_kernel_optimized[grid](
+        _vector_add_kernel_blocking[grid](
             a, b, c, n_elements,
             XBLOCK=xblock, XBLOCK_SUB=xblock_sub,
         )
@@ -213,18 +185,17 @@ def main():
     torch.npu.set_device(0)
 
     num_cores = _get_num_vector_cores()
-    element_bytes = 4  # float32
-    optimal = _optimal_block_size(element_bytes)
+    safe_block = _safe_block_size(4)
     print(f"Vector Cores: {num_cores}")
-    print(f"Optimal block size (float32): {optimal} elements = {optimal * _IO_TENSORS * element_bytes / 1024:.0f} KB/block, "
-          f"UB utilization: {optimal * _IO_TENSORS * element_bytes / (_UB_TOTAL_BYTES // 2) * 100:.0f}%")
+    print(f"Safe block size (fp32): {safe_block} elements = "
+          f"{safe_block * _IO_TENSORS * 4 / 1024:.0f} KB/block")
 
-    for size in [1024 * 64, 1024 * 1024]:
+    for size in [64 * 1024, 1024 * 1024]:
         a = torch.randn(size, device="npu", dtype=torch.float32)
         b = torch.randn(size, device="npu", dtype=torch.float32)
         ref_c = ref_program(a, b)
 
-        for mode in ["naive", "persistent", "optimized", "autotune"]:
+        for mode in ["naive", "optimized", "autotune"]:
             c = vector_add(a, b, mode=mode)
             torch.testing.assert_close(c.cpu(), ref_c.cpu(), rtol=1e-6, atol=1e-6)
             print(f"  size={size:>8}, mode={mode:>12}: PASS")

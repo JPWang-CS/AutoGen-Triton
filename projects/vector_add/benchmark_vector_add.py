@@ -1,21 +1,26 @@
 """
 Triton-Ascend 向量加法性能基准测试
 
-五路对比:
-  - Naive:     GPU 风格 grid，大量 program
-  - Persistent: 固定核数 tl.range 跨步
-  - Optimized: XBLOCK/XBLOCK_SUB constexpr 循环 + UB 最优 block
+四路对比:
+  - Naive:     GPU 风格 grid
+  - Optimized: XBLOCK/XBLOCK_SUB constexpr 循环 + UB 安全 block
   - Autotune:  @triton.autotune 自动搜索 BLOCK_SIZE + multibuffer
   - PyTorch:   原生 a + b
 
-性能指标:
-  - 执行时间 (ms)
-  - 带宽 (GB/s)
-  - 各方法间加速比
-  - 优化阶段对比
+分析维度:
+  - 延迟 (ms)
+  - 带宽 (GB/s) — 注意: do_bench 返回 ms, 转秒需 ×1e-3
+  - vs PyTorch 加速比
+  - 带宽利用率
+
+msprof 分析建议:
+  对于内存 bound 操作, 用 msprof 确认瓶颈:
+    msprof op --output=./prof_out python -c "..."
+  查看 MTE2 占比: 若 MTE2 >> Vector, 说明是带宽瓶颈, kernel 优化空间有限
 """
 
 import argparse
+import os
 import torch
 import torch_npu
 import triton
@@ -23,13 +28,23 @@ import triton.testing
 
 from vector_add import vector_add
 
+os.environ.setdefault("TRITON_BENCH_METHOD", "npu")
+
 
 def ref_program(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return a + b
 
 
-ALL_MODES = ["naive", "persistent", "optimized", "autotune"]
-MODE_NAMES = {"naive": "Naive", "persistent": "Persistent", "optimized": "Optimized", "autotune": "Autotune"}
+ALL_MODES = ["naive", "optimized", "autotune"]
+MODE_NAMES = {
+    "naive": "Naive", "optimized": "Optimized", "autotune": "Autotune",
+}
+
+
+def calc_bandwidth_gbs(n_elements: int, element_bytes: int, ms: float) -> float:
+    """3 个 I/O 张量 × n_elements × element_bytes / 时间(秒) → GB/s"""
+    bytes_total = 3 * n_elements * element_bytes
+    return bytes_total / (ms * 1e-3) * 1e-9
 
 
 # ============================================================================
@@ -64,79 +79,8 @@ def benchmark(size, provider):
             lambda: vector_add(a, b, mode=provider), quantiles=quantiles
         )
 
-    gbps = lambda ms: 3 * size * 4 / (ms * 1e-6) * 1e-9
+    gbps = lambda t: calc_bandwidth_gbs(size, 4, t)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
-
-
-# ============================================================================
-# 详细对比 benchmark
-# ============================================================================
-
-def run_comparison_benchmark(
-    size: int,
-    dtype: torch.dtype = torch.float32,
-    warmup: int = 10,
-    rep: int = 100,
-):
-    element_bytes = torch.tensor([], dtype=dtype).element_size()
-    dtype_name = {
-        torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
-    }.get(dtype, str(dtype))
-
-    a = torch.randn(size, device="npu", dtype=dtype)
-    b = torch.randn(size, device="npu", dtype=dtype)
-
-    # 精度
-    c_opt = vector_add(a, b, mode="autotune")
-    c_torch = ref_program(a, b)
-    max_diff = torch.max(torch.abs(c_opt.cpu().float() - c_torch.cpu().float())).item()
-    precision_pass = torch.allclose(
-        c_opt.cpu().float(), c_torch.cpu().float(), rtol=1e-3, atol=1e-3
-    )
-
-    # 性能
-    quantiles = [0.5, 0.2, 0.8]
-    results = {}
-    for mode in ALL_MODES:
-        ms, mn, mx = triton.testing.do_bench(
-            lambda m=mode: vector_add(a, b, mode=m), quantiles=quantiles, warmup=warmup, rep=rep
-        )
-        results[mode] = {"ms": ms, "min": mn, "max": mx}
-
-    ms_torch, _, _ = triton.testing.do_bench(
-        lambda: ref_program(a, b), quantiles=quantiles, warmup=warmup, rep=rep
-    )
-
-    bytes_moved = 3 * size * element_bytes
-
-    print("\n" + "=" * 90)
-    print(f"  Vector Add Benchmark  |  size={size:,}  |  dtype={dtype_name}")
-    print(f"  数据量: {size * element_bytes / 1024 / 1024:.2f} MB per tensor")
-    print("=" * 90)
-
-    print(f"\n  {'模式':<14} {'延迟(ms)':>10} {'带宽(GB/s)':>12} {'vs PyTorch':>12}")
-    print(f"  {'-'*48}")
-
-    for mode in ALL_MODES:
-        ms = results[mode]["ms"]
-        bw = bytes_moved / (ms * 1e-6) * 1e-9
-        sp = ms_torch / ms
-        print(f"  {MODE_NAMES[mode]:<14} {ms:>10.4f} {bw:>12.1f} {sp:>11.3f}x")
-
-    bw_torch = bytes_moved / (ms_torch * 1e-6) * 1e-9
-    print(f"  {'PYTORCH':<14} {ms_torch:>10.4f} {bw_torch:>12.1f} {'1.000x':>12}")
-
-    print(f"\n  各优化阶段提升:")
-    ms_naive = results["naive"]["ms"]
-    ms_persist = results["persistent"]["ms"]
-    ms_opt = results["optimized"]["ms"]
-    ms_atune = results["autotune"]["ms"]
-    print(f"    Naive → Persistent (固定核数):       {ms_naive / ms_persist:.2f}x")
-    print(f"    Persistent → Optimized (UB最优):     {ms_persist / ms_opt:.2f}x")
-    print(f"    Optimized → Autotune (自动搜索):     {ms_opt / ms_atune:.2f}x")
-    print(f"    Naive → Autotune (总体提升):         {ms_naive / ms_atune:.2f}x")
-    print(f"\n  精度 (rtol=1e-3): {'PASS' if precision_pass else 'FAIL'}, max_diff={max_diff:.2e}")
-    print("=" * 90)
 
 
 # ============================================================================
@@ -150,27 +94,27 @@ def run_sweep_benchmark(
     rep: int = 100,
 ):
     if sizes is None:
-        sizes = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 1024 * 1024, 4 * 1024 * 1024]
+        sizes = [4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024,
+                 1024 * 1024, 4 * 1024 * 1024]
 
     element_bytes = torch.tensor([], dtype=dtype).element_size()
     dtype_name = {
-        torch.float32: "float32", torch.float16: "float16", torch.bfloat16: "bfloat16",
+        torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16",
     }.get(dtype, str(dtype))
 
-    print("\n" + "=" * 130)
-    print(f"  Vector Add Sweep  |  dtype={dtype_name}")
-    print("=" * 130)
-    header = (f"  {'Size':>10} | {'Naive':>8} {'Persist':>8} {'Optim':>8} "
-              f"{'Atune':>8} {'Torch':>8} | {'Best BW':>7} | "
-              f"{'Atune/T':>8} {'Opt/Naive':>9} {'Atune/Opt':>9} | {'Diff':>10} | {'Pass':>4}")
-    print(header)
-    print(f"  {'-'*126}")
+    print("\n" + "=" * 100)
+    print(f"  Vector Add Sweep  |  dtype={dtype_name}  |  TRITON_BENCH_METHOD={os.environ.get('TRITON_BENCH_METHOD', 'default')}")
+    print("=" * 100)
+    print(f"  {'Size':>8} | {'Naive':>8} {'Optim':>8} {'Atune':>8} {'Torch':>8} | "
+          f"{'BW_best':>7} {'BW_torch':>8} | {'Atune/T':>8} {'Opt/Nv':>7} | {'Diff':>10} | OK")
+    print(f"  {'-'*96}")
 
-    results = []
+    all_results = []
     for size in sizes:
         a = torch.randn(size, device="npu", dtype=dtype)
         b = torch.randn(size, device="npu", dtype=dtype)
 
+        # 精度
         c_atune = vector_add(a, b, mode="autotune")
         c_torch = ref_program(a, b)
         max_diff = torch.max(torch.abs(c_atune.cpu().float() - c_torch.cpu().float())).item()
@@ -178,45 +122,111 @@ def run_sweep_benchmark(
             c_atune.cpu().float(), c_torch.cpu().float(), rtol=1e-3, atol=1e-3
         )
 
-        ms_results = {}
+        # 性能
+        ms_map = {}
         for mode in ALL_MODES:
             ms, _, _ = triton.testing.do_bench(
                 lambda m=mode: vector_add(a, b, mode=m),
-                quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
+                quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep,
             )
-            ms_results[mode] = ms
+            ms_map[mode] = ms
 
         ms_torch, _, _ = triton.testing.do_bench(
-            lambda: ref_program(a, b), quantiles=[0.5, 0.2, 0.8], warmup=warmup, rep=rep
+            lambda: ref_program(a, b), quantiles=[0.5, 0.2, 0.8],
+            warmup=warmup, rep=rep,
         )
 
-        bytes_moved = 3 * size * element_bytes
-        bw_best = bytes_moved / (min(ms_results[m] for m in ALL_MODES) * 1e-6) * 1e-9
-        sp_atune_torch = ms_torch / ms_results["autotune"]
-        sp_opt_naive = ms_results["naive"] / ms_results["optimized"]
-        sp_atune_opt = ms_results["optimized"] / ms_results["autotune"]
+        bw_best = calc_bandwidth_gbs(size, element_bytes, min(ms_map.values()))
+        bw_torch = calc_bandwidth_gbs(size, element_bytes, ms_torch)
+        sp_atune_t = ms_torch / ms_map["autotune"]
+        sp_opt_nv = ms_map["naive"] / ms_map["optimized"]
         size_str = f"{size//1024}K" if size < 1024*1024 else f"{size//1024//1024}M"
-        pass_str = "OK" if precision_pass else "FAIL"
 
-        print(f"  {size_str:>10} | {ms_results['naive']:>7.3f}  {ms_results['persistent']:>7.3f}  "
-              f"{ms_results['optimized']:>7.3f}  {ms_results['autotune']:>7.3f}  {ms_torch:>7.3f} | "
-              f"{bw_best:>6.1f}  | {sp_atune_torch:>7.3f}x {sp_opt_naive:>8.3f}x {sp_atune_opt:>8.3f}x | "
-              f"{max_diff:>10.2e} | {pass_str:>4}")
+        print(f"  {size_str:>8} | {ms_map['naive']:>7.3f}  {ms_map['optimized']:>7.3f}  "
+              f"{ms_map['autotune']:>7.3f}  {ms_torch:>7.3f} | "
+              f"{bw_best:>6.1f}  {bw_torch:>7.1f} | "
+              f"{sp_atune_t:>7.3f}x {sp_opt_nv:>6.3f}x | "
+              f"{max_diff:>10.2e} | {'OK' if precision_pass else 'FAIL'}")
 
-        results.append({
-            "sp_atune_torch": sp_atune_torch, "sp_opt_naive": sp_opt_naive,
-            "sp_atune_opt": sp_atune_opt, "pass": precision_pass,
+        all_results.append({
+            "sp_atune_t": sp_atune_t, "sp_opt_nv": sp_opt_nv, "pass": precision_pass,
         })
 
-    print("=" * 130)
-    all_pass = all(r["pass"] for r in results)
-    avg_atune_torch = sum(r["sp_atune_torch"] for r in results) / len(results)
-    avg_opt_naive = sum(r["sp_opt_naive"] for r in results) / len(results)
-    avg_atune_opt = sum(r["sp_atune_opt"] for r in results) / len(results)
+    print("=" * 100)
+    all_pass = all(r["pass"] for r in all_results)
+    avg_at = sum(r["sp_atune_t"] for r in all_results) / len(all_results)
+    avg_on = sum(r["sp_opt_nv"] for r in all_results) / len(all_results)
     print(f"  精度: {'ALL PASS' if all_pass else 'HAS FAIL'}")
-    print(f"  平均提升:  Autotune vs PyTorch={avg_atune_torch:.3f}x  |  "
-          f"Optimized vs Naive={avg_opt_naive:.2f}x  |  "
-          f"Autotune vs Optimized={avg_atune_opt:.3f}x")
+    print(f"  平均:  Autotune/Torch={avg_at:.3f}x  |  Optimized/Naive={avg_on:.3f}x")
+    print(f"\n  注: vector_add 是纯内存 bound 操作 (2load+1store+1add)")
+    print(f"      kernel 结构优化对内存 bound 操作收益有限，瓶颈在 GM 带宽")
+    print(f"      建议用 msprof op 确认 MTE2 占比，若 MTE2>>Vector 则为带宽瓶颈")
+
+
+# ============================================================================
+# 详细对比 benchmark (单 size)
+# ============================================================================
+
+def run_comparison_benchmark(
+    size: int,
+    dtype: torch.dtype = torch.float32,
+    warmup: int = 10,
+    rep: int = 100,
+):
+    element_bytes = torch.tensor([], dtype=dtype).element_size()
+    dtype_name = {
+        torch.float32: "fp32", torch.float16: "fp16", torch.bfloat16: "bf16",
+    }.get(dtype, str(dtype))
+
+    a = torch.randn(size, device="npu", dtype=dtype)
+    b = torch.randn(size, device="npu", dtype=dtype)
+
+    # 精度
+    c_auto = vector_add(a, b, mode="autotune")
+    c_torch = ref_program(a, b)
+    max_diff = torch.max(torch.abs(c_auto.cpu().float() - c_torch.cpu().float())).item()
+
+    # 性能
+    quantiles = [0.5, 0.2, 0.8]
+    ms_map = {}
+    for mode in ALL_MODES:
+        ms, mn, mx = triton.testing.do_bench(
+            lambda m=mode: vector_add(a, b, mode=m),
+            quantiles=quantiles, warmup=warmup, rep=rep,
+        )
+        ms_map[mode] = {"ms": ms, "min": mn, "max": mx}
+
+    ms_torch, _, _ = triton.testing.do_bench(
+        lambda: ref_program(a, b), quantiles=quantiles, warmup=warmup, rep=rep
+    )
+
+    print("\n" + "=" * 80)
+    print(f"  Vector Add  |  size={size:,}  |  dtype={dtype_name}")
+    print(f"  数据量: {size * element_bytes / 1024 / 1024:.2f} MB/tensor × 3 = "
+          f"{3 * size * element_bytes / 1024 / 1024:.2f} MB")
+    print("=" * 80)
+
+    print(f"\n  {'模式':<12} {'延迟(ms)':>10} {'带宽(GB/s)':>11} {'vs Torch':>10}")
+    print(f"  {'-'*43}")
+
+    for mode in ALL_MODES:
+        ms = ms_map[mode]["ms"]
+        bw = calc_bandwidth_gbs(size, element_bytes, ms)
+        sp = ms_torch / ms
+        print(f"  {MODE_NAMES[mode]:<12} {ms:>10.4f} {bw:>11.1f} {sp:>9.3f}x")
+
+    bw_t = calc_bandwidth_gbs(size, element_bytes, ms_torch)
+    print(f"  {'PYTORCH':<12} {ms_torch:>10.4f} {bw_t:>11.1f} {'1.000x':>10}")
+
+    ms_nv = ms_map["naive"]["ms"]
+    ms_opt = ms_map["optimized"]["ms"]
+    ms_at = ms_map["autotune"]["ms"]
+    print(f"\n  优化阶段:")
+    print(f"    Naive → Optimized (constexpr+UB安全):  {ms_nv / ms_opt:.3f}x")
+    print(f"    Optimized → Autotune (自动搜索):        {ms_opt / ms_at:.3f}x")
+    print(f"    Naive → Autotune (总体):                {ms_nv / ms_at:.3f}x")
+    print(f"\n  精度: max_diff={max_diff:.2e}")
+    print("=" * 80)
 
 
 def main():

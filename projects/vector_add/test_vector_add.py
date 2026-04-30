@@ -1,7 +1,7 @@
 """
 Triton-Ascend 向量加法测试
 
-覆盖四种模式: naive / persistent / optimized / autotune
+覆盖三种模式: naive / optimized / autotune
 """
 
 import torch
@@ -29,7 +29,7 @@ class TestVectorAdd:
     def setup_method(self):
         setup_npu()
 
-    @pytest.mark.parametrize("mode", ["naive", "persistent", "optimized", "autotune"])
+    @pytest.mark.parametrize("mode", ["naive", "optimized", "autotune"])
     def test_basic_correctness(self, mode):
         a = torch.randn(1024, device="npu", dtype=torch.float32)
         b = torch.randn(1024, device="npu", dtype=torch.float32)
@@ -37,7 +37,7 @@ class TestVectorAdd:
         ref_c = a.cpu() + b.cpu()
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-6, atol=1e-6)
 
-    @pytest.mark.parametrize("mode", ["naive", "persistent", "optimized", "autotune"])
+    @pytest.mark.parametrize("mode", ["naive", "optimized", "autotune"])
     @pytest.mark.parametrize("size", [64, 128, 256, 1024, 4096, 65536, 1048576])
     def test_various_sizes(self, mode, size):
         a = torch.randn(size, device="npu", dtype=torch.float32)
@@ -46,7 +46,7 @@ class TestVectorAdd:
         ref_c = a.cpu() + b.cpu()
         torch.testing.assert_close(c.cpu(), ref_c, rtol=1e-6, atol=1e-6)
 
-    @pytest.mark.parametrize("mode", ["naive", "persistent", "optimized", "autotune"])
+    @pytest.mark.parametrize("mode", ["naive", "optimized", "autotune"])
     @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
     def test_dtypes(self, mode, dtype):
         a = torch.randn(1024, device="npu", dtype=dtype)
