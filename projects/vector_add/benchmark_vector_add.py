@@ -21,14 +21,17 @@ msprof 分析建议:
 
 import argparse
 import os
+
+# 抑制 CANN profiler 日志噪音 (0=DEBUG, 1=INFO, 2=WARNING, 3=ERROR)
+os.environ["ASCEND_GLOBAL_LOG_LEVEL"] = "3"
+os.environ.setdefault("TRITON_BENCH_METHOD", "npu")
+
 import torch
 import torch_npu
 import triton
 import triton.testing
 
 from vector_add import vector_add
-
-os.environ.setdefault("TRITON_BENCH_METHOD", "npu")
 
 
 def ref_program(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
