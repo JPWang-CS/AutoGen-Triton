@@ -10,7 +10,7 @@ import argparse
 import torch
 import triton
 import triton.testing
-from reduce_xor import reduce_xor, ref_program as ref_xor
+from xor import reduce_xor, ref_program as ref_xor
 
 
 def run_sweep(warmup=10, rep=100):

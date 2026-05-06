@@ -10,7 +10,7 @@ import argparse
 import torch
 import triton
 import triton.testing
-from reduce_sum import reduce_sum, ref_program as ref_sum
+from sum import reduce_sum, ref_program as ref_sum
 
 
 def run_sweep(dtype=torch.float32, warmup=10, rep=100):

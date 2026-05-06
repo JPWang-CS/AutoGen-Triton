@@ -1,5 +1,5 @@
 """
-Triton-Ascend Reduce Min 性能基准测试
+Triton-Ascend Reduce Argmin 性能基准测试
 """
 
 import sys
@@ -10,33 +10,32 @@ import argparse
 import torch
 import triton
 import triton.testing
-from reduce_min import reduce_min, ref_program as ref_min
+from argmin import reduce_argmin, ref_program as ref_argmin
 
 
 def run_sweep(dtype=torch.float32, warmup=10, rep=100):
     shapes = [(128, 256), (256, 512), (512, 1024), (1024, 2048), (2048, 4096)]
 
-    print(f"\n  Reduce Min Sweep  |  dtype={dtype}")
-    print(f"  {'Shape':>14} | {'Triton(ms)':>10} {'Torch(ms)':>10} | {'Speedup':>8} | {'Diff':>10} | {'Pass':>4}")
-    print(f"  {'-'*70}")
+    print(f"\n  Reduce Argmin Sweep  |  dtype={dtype}")
+    print(f"  {'Shape':>14} | {'Triton(ms)':>10} {'Torch(ms)':>10} | {'Speedup':>8} | {'Pass':>4}")
+    print(f"  {'-'*60}")
 
     for shape in shapes:
         x = torch.randn(*shape, device="npu", dtype=dtype)
-        ms_t, _, _ = triton.testing.do_bench(lambda: reduce_min(x), warmup=warmup, rep=rep)
-        ms_r, _, _ = triton.testing.do_bench(lambda: ref_min(x), warmup=warmup, rep=rep)
+        ms_t, _, _ = triton.testing.do_bench(lambda: reduce_argmin(x), warmup=warmup, rep=rep)
+        ms_r, _, _ = triton.testing.do_bench(lambda: ref_argmin(x), warmup=warmup, rep=rep)
 
-        ref = ref_min(x)
-        result = reduce_min(x)
-        diff = torch.max(torch.abs(result.cpu().float() - ref.cpu().float())).item()
-        passed = torch.allclose(result.cpu().float(), ref.cpu().float(), rtol=1e-3, atol=1e-3)
+        ref = ref_argmin(x)
+        result = reduce_argmin(x)
+        passed = torch.equal(result.cpu(), ref.cpu())
 
-        print(f"  ({shape[0]:>4},{shape[1]:>4})  | {ms_t:>10.4f} {ms_r:>10.4f} | {ms_r/ms_t:>7.3f}x | {diff:>10.2e} | {'OK' if passed else 'FAIL':>4}")
+        print(f"  ({shape[0]:>4},{shape[1]:>4})  | {ms_t:>10.4f} {ms_r:>10.4f} | {ms_r/ms_t:>7.3f}x | {'OK' if passed else 'FAIL':>4}")
 
-    print(f"  {'='*70}")
+    print(f"  {'='*60}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Reduce Min Benchmark")
+    parser = argparse.ArgumentParser(description="Reduce Argmin Benchmark")
     parser.add_argument("--rows", type=int, default=4096)
     parser.add_argument("--cols", type=int, default=1024)
     parser.add_argument("--dtype", type=str, default="float32", choices=["float32", "float16", "bfloat16"])
@@ -53,9 +52,9 @@ def main():
     else:
         shape = (args.rows, args.cols)
         x = torch.randn(*shape, device="npu", dtype=dtype)
-        ms_t, _, _ = triton.testing.do_bench(lambda: reduce_min(x), warmup=args.warmup, rep=args.rep)
-        ms_r, _, _ = triton.testing.do_bench(lambda: ref_min(x), warmup=args.warmup, rep=args.rep)
-        print(f"  Reduce Min  shape={shape}  dtype={args.dtype}")
+        ms_t, _, _ = triton.testing.do_bench(lambda: reduce_argmin(x), warmup=args.warmup, rep=args.rep)
+        ms_r, _, _ = triton.testing.do_bench(lambda: ref_argmin(x), warmup=args.warmup, rep=args.rep)
+        print(f"  Reduce Argmin  shape={shape}  dtype={args.dtype}")
         print(f"  Triton: {ms_t:.4f} ms  Torch: {ms_r:.4f} ms  Speedup: {ms_r/ms_t:.3f}x")
 
 

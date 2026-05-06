@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import torch
 import pytest
-from reduce_xor import reduce_xor, ref_program as ref_xor
+from xor import reduce_xor, ref_program as ref_xor
 
 
 SHAPES_2D = [(16, 64), (128, 256), (256, 512), (512, 1024)]
