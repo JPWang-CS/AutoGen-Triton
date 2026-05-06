@@ -109,7 +109,9 @@ def reduce_sum(x: torch.Tensor, axis: int = -1, mode: str = "kahan") -> torch.Te
     num_cores = _get_num_vector_cores()
     xblock = triton.cdiv(n_rows, num_cores)
     xblock_sub = min(xblock, 8)
-    rblock = _safe_rblock(n_cols, xblock_sub, num_tensors=2)
+    # kahan 多一个 c 补偿变量 [xsub, RBLOCK]，需多算一份
+    num_ub_tensors = 3 if mode == "kahan" else 2
+    rblock = _safe_rblock(n_cols, xblock_sub, num_tensors=num_ub_tensors)
 
     kernel = _reduce_sum_kahan_kernel if mode == "kahan" else _reduce_sum_kernel
     kernel[(num_cores, 1, 1)](
